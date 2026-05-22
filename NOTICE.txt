@@ -1,0 +1,2 @@
+opensearch-otlp-receiver (https://github.com/SAP/opensearch-otlp-receiver)
+Copyright 2026 SAP SE or an SAP affiliate company and opensearch-otlp-receiver contributors

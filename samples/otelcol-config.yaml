@@ -1,0 +1,47 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 100
+    timeout: 5s
+
+  resourcedetection:
+    detectors: [env, system]
+    system:
+      hostname_sources: [os]
+
+exporters:
+  # Forward to the OpenSearch OTLP plugin via gRPC
+  otlp/opensearch:
+    endpoint: opensearch:4317
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [otlp/opensearch, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [otlp/opensearch, debug]
+    logs:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [otlp/opensearch, debug]
