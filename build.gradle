@@ -199,11 +199,11 @@ dependencies {
     // SLF4J API (required by Armeria; OpenSearch uses Log4j2 but does not ship slf4j)
     implementation 'org.slf4j:slf4j-api:2.0.17'
 
-    // Jackson extras (jackson-core is in OpenSearch lib; databind and type modules are not)
-    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.21'
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.21.2'
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.21.2'
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.2'
+    // Jackson 2.x (required at runtime by Armeria for JSON transcoding; OpenSearch 3.9.0 moved to
+    // tools.jackson / Jackson 3.x and no longer ships com.fasterxml.jackson 2.x in lib/)
+    implementation 'com.fasterxml.jackson.core:jackson-core:2.22.2'
+    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.22'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.2'
 
     // Micrometer (pulled in by Armeria for metrics; none shipped by OpenSearch)
     implementation 'io.micrometer:micrometer-core:1.16.4'
@@ -223,7 +223,7 @@ dependencies {
     implementation 'org.latencyutils:LatencyUtils:2.0.3'
     implementation 'com.aayushatharva.brotli4j:brotli4j:1.22.0'
     // reactor-core and reactive-streams are in OpenSearch lib/, no need to bundle
-    compileOnly 'io.projectreactor:reactor-core:3.8.4'
+    compileOnly 'io.projectreactor:reactor-core:3.8.7'
 
     // OTel SDK exporters — used only in integration tests to send real OTLP signals.
     // OpenSearch build tools disable transitive resolution for non-opensearch deps,
