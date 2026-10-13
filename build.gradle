@@ -156,7 +156,7 @@ dependencies {
     implementation 'com.google.protobuf:protobuf-java:4.34.0'
     implementation 'com.google.protobuf:protobuf-java-util:4.34.0'
 
-    // Armeria: unified gRPC + HTTP server (Netty 4.2.12.Final matches OpenSearch 3.6.0)
+    // Armeria: unified gRPC + HTTP server (Netty 4.2.18.Final matches OpenSearch 3.9.0)
     // OpenSearch build tools disable transitive resolution for non-opensearch deps,
     // so every transitive dependency must be listed explicitly below.
     implementation 'com.linecorp.armeria:armeria:1.38.0'
@@ -177,24 +177,24 @@ dependencies {
     implementation 'io.perfmark:perfmark-api:0.27.0'
 
     // Netty extras not in OpenSearch lib/ (transport-netty4 is a module, not on plugin classpath)
-    implementation 'io.netty:netty-buffer:4.2.12.Final'
-    implementation 'io.netty:netty-codec-base:4.2.12.Final'
-    implementation 'io.netty:netty-codec-compression:4.2.12.Final'
-    implementation 'io.netty:netty-codec-dns:4.2.12.Final'
-    implementation 'io.netty:netty-codec-haproxy:4.2.12.Final'
-    implementation 'io.netty:netty-codec-http:4.2.12.Final'
-    implementation 'io.netty:netty-codec-http2:4.2.12.Final'
-    implementation 'io.netty:netty-codec-socks:4.2.12.Final'
-    implementation 'io.netty:netty-common:4.2.12.Final'
-    implementation 'io.netty:netty-handler:4.2.12.Final'
-    implementation 'io.netty:netty-handler-proxy:4.2.12.Final'
-    implementation 'io.netty:netty-resolver:4.2.12.Final'
-    implementation 'io.netty:netty-resolver-dns:4.2.12.Final'
-    implementation 'io.netty:netty-resolver-dns-classes-macos:4.2.12.Final'
-    implementation 'io.netty:netty-transport:4.2.12.Final'
-    implementation 'io.netty:netty-transport-classes-epoll:4.2.12.Final'
-    implementation 'io.netty:netty-transport-classes-kqueue:4.2.12.Final'
-    implementation 'io.netty:netty-transport-native-unix-common:4.2.12.Final'
+    implementation 'io.netty:netty-buffer:4.2.18.Final'
+    implementation 'io.netty:netty-codec-base:4.2.18.Final'
+    implementation 'io.netty:netty-codec-compression:4.2.18.Final'
+    implementation 'io.netty:netty-codec-dns:4.2.18.Final'
+    implementation 'io.netty:netty-codec-haproxy:4.2.18.Final'
+    implementation 'io.netty:netty-codec-http:4.2.18.Final'
+    implementation 'io.netty:netty-codec-http2:4.2.18.Final'
+    implementation 'io.netty:netty-codec-socks:4.2.18.Final'
+    implementation 'io.netty:netty-common:4.2.18.Final'
+    implementation 'io.netty:netty-handler:4.2.18.Final'
+    implementation 'io.netty:netty-handler-proxy:4.2.18.Final'
+    implementation 'io.netty:netty-resolver:4.2.18.Final'
+    implementation 'io.netty:netty-resolver-dns:4.2.18.Final'
+    implementation 'io.netty:netty-resolver-dns-classes-macos:4.2.18.Final'
+    implementation 'io.netty:netty-transport:4.2.18.Final'
+    implementation 'io.netty:netty-transport-classes-epoll:4.2.18.Final'
+    implementation 'io.netty:netty-transport-classes-kqueue:4.2.18.Final'
+    implementation 'io.netty:netty-transport-native-unix-common:4.2.18.Final'
 
     // SLF4J API (required by Armeria; OpenSearch uses Log4j2 but does not ship slf4j)
     implementation 'org.slf4j:slf4j-api:2.0.17'
