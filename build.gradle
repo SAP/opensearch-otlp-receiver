@@ -12,6 +12,7 @@ buildscript {
 
     dependencies {
         classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+        classpath 'com.google.protobuf:protobuf-gradle-plugin:0.9.4'
     }
 }
 
@@ -19,6 +20,7 @@ apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.pluginzip'
 apply plugin: 'opensearch.java-agent'
+apply plugin: 'com.google.protobuf'
 publishing {
     publications {
         pluginZip(MavenPublication) { publication ->
@@ -50,6 +52,32 @@ opensearchplugin {
     noticeFile rootProject.file('NOTICE.txt')
 }
 
+protobuf {
+    protoc {
+        artifact = 'com.google.protobuf:protoc:3.25.8'
+    }
+    plugins {
+        grpc {
+            artifact = 'io.grpc:protoc-gen-grpc-java:1.80.0'
+        }
+    }
+    generateProtoTasks {
+        all()*.plugins {
+            grpc {}
+        }
+    }
+}
+
+// The opentelemetry-proto JAR bundles google/protobuf well-known types alongside the OTel
+// proto definitions.  Re-generating them would produce com.google.protobuf.* classes that
+// duplicate OpenSearch's lib/protobuf-java and fail the jar hell checker.  Delete them after
+// extraction so protoc only compiles the opentelemetry.proto.* packages.
+tasks.matching { it.name == 'extractProto' }.configureEach {
+    doLast {
+        delete layout.buildDirectory.dir("extracted-protos/main/google")
+    }
+}
+
 // Disable checks not relevant for this plugin
 thirdPartyAudit.enabled = false
 loggerUsageCheck.enabled = false
@@ -65,39 +93,34 @@ repositories {
     maven { url "https://plugins.gradle.org/m2/" }
 }
 
-// ── Protobuf shading ──────────────────────────────────────────────────────────
+// ── Shading ───────────────────────────────────────────────────────────────────
 //
-// OpenSearch ships protobuf-java 3.x in lib/. The OTel proto classes require
-// protobuf 4.x. The jar hell checker (runs before the plugin classloader is set
-// up) rejects any jar whose classes duplicate names already in lib/.
+// The plugin uses OpenSearch's bundled protobuf-java (3.x in lib/) and must NOT
+// bundle it again — that would fail the jar hell checker.  All other runtime deps
+// (Armeria, gRPC, Netty extras, Jackson 2.x, Micrometer, Guava …) are absorbed
+// into a single fat jar so that OpenSearch's jar hell checker sees each class in
+// exactly one place.
 //
-// Partial shading (absorbing only the proto jars) fails because Armeria's gRPC
-// layer passes com.google.protobuf.Message objects across the boundary between
-// shaded and unshaded jars, causing NoSuchMethodError at runtime.
-//
-// Solution: build a shaded jar that absorbs the plugin's own classes plus all
-// runtime deps the plugin must bundle (runtimeClasspath minus resolveableCompileOnly,
-// which mirrors exactly what bundlePlugin uses for loose-jar bundling), then
-// relocates com.google.protobuf so there is no name clash with lib/protobuf-java-3.x.
+// Micrometer is relocated because ContextRegistry uses ServiceLoader to discover
+// ContextAccessor implementations.  reactor-core in lib/ registers its accessor
+// under the un-relocated name, which would shadow our private copy; after
+// relocation the service file in lib/reactor-core is effectively invisible to
+// the plugin classloader.
 //
 // The Shadow plugin is NOT applied at the project level to avoid a compatibility
 // issue with opensearch.publish (which calls getByName("shadow") inside a
 // withPlugin callback before Shadow 9.x registers its component lazily).
 // Instead, a ShadowJar task is registered directly using the task type from the
 // shadow-gradle-plugin jar that build-tools already bundles.
-//
-// resolutionStrategy.force pins protobuf-java to 4.34.0 so Gradle resolves a
-// single version at compile time and does not raise a conflict error.
 // ─────────────────────────────────────────────────────────────────────────────
 
 configurations.all {
-    resolutionStrategy.force 'com.google.protobuf:protobuf-java:4.34.0'
-    resolutionStrategy.force 'com.google.protobuf:protobuf-java-util:4.34.0'
+    resolutionStrategy.force 'com.google.protobuf:protobuf-java:3.25.8'
+    resolutionStrategy.force 'com.google.protobuf:protobuf-java-util:3.25.8'
 }
 
 tasks.register('shadedJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
     archiveClassifier = 'all'
-    relocate 'com.google.protobuf', 'org.opensearch.plugin.otlp.shaded.com.google.protobuf'
     // Relocate micrometer so that ContextRegistry (which uses ServiceLoader to find
     // ContextAccessor implementations) looks for the relocated interface name rather than
     // io.micrometer.context.ContextAccessor.  reactor-core in lib/ registers
@@ -108,16 +131,13 @@ tasks.register('shadedJar', com.github.jengelman.gradle.plugins.shadow.tasks.Sha
     relocate 'io.micrometer', 'org.opensearch.plugin.otlp.shaded.io.micrometer'
 
     // Absorb only jars the plugin must provide itself.  resolveableCompileOnly is
-    // the set of "provided" artifacts computed by opensearch.opensearchplugin.
-    // We subtract it from runtimeClasspath, but keep com.google.protobuf jars —
-    // OpenSearch ships protobuf-java 3.x; we must bundle 4.x with relocation so
-    // the jar hell checker sees only the relocated (private) package name.
+    // the set of "provided" artifacts computed by opensearch.opensearchplugin; it
+    // includes protobuf-java (from OpenSearch lib/), so that jar is excluded here.
     configurations = []
     with jar
     from({
         def provided = project.configurations.resolveableCompileOnly
             .resolvedConfiguration.resolvedArtifacts
-            .findAll { it.moduleVersion.id.module.group != 'com.google.protobuf' }
             .collect { it.file } as Set
         project.configurations.runtimeClasspath
             .findAll { !(it in provided) }
@@ -150,11 +170,13 @@ tasks.named('bundlePlugin').configure {
 }
 
 dependencies {
-    // OpenTelemetry protobuf definitions (requires protobuf 4.x runtime; see comment above)
-    implementation 'io.opentelemetry.proto:opentelemetry-proto:1.10.0-alpha'
-
-    implementation 'com.google.protobuf:protobuf-java:4.34.0'
-    implementation 'com.google.protobuf:protobuf-java-util:4.34.0'
+    // OTLP proto sources are extracted from the opentelemetry-proto artifact by the
+    // com.google.protobuf plugin and compiled by protoc 3.25.8.  The extractProto hook
+    // above removes the bundled google/protobuf well-known types before code generation.
+    // protobuf-java itself is NOT bundled — OpenSearch ships it in lib/ (3.25.8).
+    // protobuf-java-util is bundled because OpenSearch does not provide it.
+    protobuf 'io.opentelemetry.proto:opentelemetry-proto:1.10.0-alpha'
+    implementation 'com.google.protobuf:protobuf-java-util:3.25.8'
 
     // Armeria: unified gRPC + HTTP server (Netty 4.2.18.Final matches OpenSearch 3.9.0)
     // OpenSearch build tools disable transitive resolution for non-opensearch deps,
