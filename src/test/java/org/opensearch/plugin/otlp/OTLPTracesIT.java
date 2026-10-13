@@ -10,119 +10,66 @@
  */
 package org.opensearch.plugin.otlp;
 
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.sdk.trace.SdkTracerProvider;
-import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import com.google.protobuf.ByteString;
+import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest;
+import io.opentelemetry.proto.common.v1.AnyValue;
+import io.opentelemetry.proto.common.v1.InstrumentationScope;
+import io.opentelemetry.proto.common.v1.KeyValue;
+import io.opentelemetry.proto.resource.v1.Resource;
+import io.opentelemetry.proto.trace.v1.ResourceSpans;
+import io.opentelemetry.proto.trace.v1.ScopeSpans;
+import io.opentelemetry.proto.trace.v1.Span;
+import io.opentelemetry.proto.trace.v1.Status;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.search.SearchHit;
 
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
- * End-to-end integration tests for OTLP trace ingestion. Each test method
- * covers the same assertion via a different transport: HTTP/JSON, HTTP/protobuf,
- * and gRPC. Mapping assertions use an index name that matches the ss4o_traces
- * composable template pattern (otel-v1-apm-span-*) so that template-defined
- * keyword / date_nanos / long types are applied.
+ * End-to-end integration tests for OTLP trace ingestion. Each test
+ * constructs an OTLP proto request and calls the gRPC service implementation
+ * directly — no network connection is needed.
  */
 public class OTLPTracesIT extends OTLPPluginITBase {
 
-    // Matches the ss4o_traces template pattern "otel-v1-apm-span-*".
-    private static final String INDEX = "otel-v1-apm-span-test";
+    private static final ByteString TRACE_ID = ByteString.copyFrom(
+        new byte[]{ 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 });
+    private static final ByteString SPAN_ID = ByteString.copyFrom(
+        new byte[]{ 1,2,3,4,5,6,7,8 });
 
-    // JSON payload — uses the OTLP JSON protobuf format (bytes fields are base64).
-    private static final String JSON_PAYLOAD = "{\n"
-        + "  \"resourceSpans\": [{\n"
-        + "    \"resource\": {\n"
-        + "      \"attributes\": [{\"key\": \"service.name\","
-        +          " \"value\": {\"stringValue\": \"e2e-svc\"}}]\n"
-        + "    },\n"
-        + "    \"scopeSpans\": [{\n"
-        + "      \"scope\": {\"name\": \"e2e-lib\", \"version\": \"1.0\"},\n"
-        + "      \"spans\": [{\n"
-        + "        \"traceId\": \"AQIDBAUGBwgJCgsMDQ4PEA==\",\n"
-        + "        \"spanId\":  \"AQIDBAUGBwg=\",\n"
-        + "        \"name\": \"e2e-span\",\n"
-        + "        \"kind\": \"SPAN_KIND_SERVER\",\n"
-        + "        \"startTimeUnixNano\": \"1000000000\",\n"
-        + "        \"endTimeUnixNano\":   \"2000000000\",\n"
-        + "        \"attributes\": [{\"key\": \"http.method\","
-        +          " \"value\": {\"stringValue\": \"GET\"}}],\n"
-        + "        \"status\": {\"code\": \"STATUS_CODE_OK\"}\n"
-        + "      }]\n"
-        + "    }]\n"
-        + "  }]\n"
-        + "}";
+    // ── field values ─────────────────────────────────────────────────────────
 
-    // ── transport: HTTP/JSON ──────────────────────────────────────────────────────
-
-    public void testSpanFields_httpJson() throws Exception {
-        sendJsonOTLP("/v1/traces", JSON_PAYLOAD);
-        assertSpanDocument(INDEX);
+    public void testSpanFields() throws Exception {
+        export(traceRequest("e2e-svc", "e2e-lib", "e2e-span", Span.SpanKind.SPAN_KIND_SERVER,
+            TRACE_ID, SPAN_ID, null));
+        assertSpanDocument(TRACES_INDEX);
     }
 
-    // ── transport: HTTP/protobuf ──────────────────────────────────────────────────
-
-    public void testSpanFields_httpProto() throws Exception {
-        emitSpan(OtlpProtocol.HTTP_PROTOBUF);
-        assertSpanDocument(INDEX);
-    }
-
-    // ── transport: gRPC ──────────────────────────────────────────────────────────
-
-    public void testSpanFields_grpc() throws Exception {
-        emitSpan(OtlpProtocol.GRPC);
-        assertSpanDocument(INDEX);
-    }
-
-    // ── mapping: applied from composable template (keyword, date_nanos, long) ────
+    // ── mapping: template types applied ──────────────────────────────────────
 
     public void testSpanMappingTypes() throws Exception {
-        emitSpan(OtlpProtocol.GRPC);
-        refresh(INDEX);
+        export(traceRequest("e2e-svc", "e2e-lib", "e2e-span", Span.SpanKind.SPAN_KIND_SERVER,
+            TRACE_ID, SPAN_ID, null));
+        refresh(TRACES_INDEX);
 
         GetMappingsResponse resp = client().admin().indices()
-            .prepareGetMappings(INDEX).get();
+            .prepareGetMappings(TRACES_INDEX).get();
         @SuppressWarnings("unchecked")
         Map<String, Object> props = (Map<String, Object>)
-            ((Map<String, Object>) resp.getMappings().get(INDEX).sourceAsMap().get("properties"));
+            ((Map<String, Object>) resp.getMappings().get(TRACES_INDEX).sourceAsMap().get("properties"));
 
-        // Fields defined in the ss4o_traces template → must use exact template types.
-        assertMappingType(props, "traceId",        "keyword");
-        assertMappingType(props, "spanId",         "keyword");
-        assertMappingType(props, "serviceName",    "keyword");
-        assertMappingType(props, "name",           "keyword");
-        assertMappingType(props, "kind",           "keyword");
-        assertMappingType(props, "durationInNanos","long");
-        assertMappingType(props, "startTime",      "date_nanos");
-        assertMappingType(props, "endTime",        "date_nanos");
+        assertMappingType(props, "traceId",         "keyword");
+        assertMappingType(props, "spanId",          "keyword");
+        assertMappingType(props, "serviceName",     "keyword");
+        assertMappingType(props, "name",            "keyword");
+        assertMappingType(props, "kind",            "keyword");
+        assertMappingType(props, "durationInNanos", "long");
+        assertMappingType(props, "startTime",       "date_nanos");
+        assertMappingType(props, "endTime",         "date_nanos");
     }
 
-    // ── signal emission ───────────────────────────────────────────────────────────
-
-    private void emitSpan(OtlpProtocol protocol) throws Exception {
-        var exporter = buildSpanExporter(protocol);
-        var provider = SdkTracerProvider.builder()
-            .addSpanProcessor(SimpleSpanProcessor.create(exporter))
-            .setResource(telemetryResource("e2e-svc"))
-            .build();
-        try {
-            provider.get("e2e-lib").spanBuilder("e2e-span")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("http.method", "GET")
-                .startSpan()
-                .setStatus(StatusCode.OK)
-                .end();
-            provider.forceFlush().join(10, TimeUnit.SECONDS);
-        } finally {
-            provider.shutdown().join(10, TimeUnit.SECONDS);
-        }
-    }
-
-    // ── shared document assertion ─────────────────────────────────────────────────
+    // ── document assertion ────────────────────────────────────────────────────
 
     private void assertSpanDocument(String index) {
         refresh(index);
@@ -152,5 +99,48 @@ public class OTLPTracesIT extends OTLPPluginITBase {
         Map<String, Object> scope = (Map<String, Object>) src.get("instrumentationScope");
         assertNotNull(scope);
         assertEquals("e2e-lib", scope.get("name"));
+    }
+
+    // ── proto builder helpers ─────────────────────────────────────────────────
+
+    static ExportTraceServiceRequest traceRequest(
+            String serviceName, String scopeName, String spanName,
+            Span.SpanKind kind, ByteString traceId, ByteString spanId,
+            ByteString parentSpanId) {
+        long nowNanos = System.currentTimeMillis() * 1_000_000L;
+        Span.Builder spanBuilder = Span.newBuilder()
+            .setTraceId(traceId)
+            .setSpanId(spanId)
+            .setName(spanName)
+            .setKind(kind)
+            .setStartTimeUnixNano(nowNanos - 1_000_000_000L)
+            .setEndTimeUnixNano(nowNanos)
+            .addAttributes(KeyValue.newBuilder()
+                .setKey("http.method")
+                .setValue(AnyValue.newBuilder().setStringValue("GET").build())
+                .build())
+            .setStatus(Status.newBuilder()
+                .setCode(Status.StatusCode.STATUS_CODE_OK)
+                .build());
+        if (parentSpanId != null) {
+            spanBuilder.setParentSpanId(parentSpanId);
+        }
+        return ExportTraceServiceRequest.newBuilder()
+            .addResourceSpans(ResourceSpans.newBuilder()
+                .setResource(Resource.newBuilder()
+                    .addAttributes(KeyValue.newBuilder()
+                        .setKey("service.name")
+                        .setValue(AnyValue.newBuilder().setStringValue(serviceName).build())
+                        .build())
+                    .build())
+                .addScopeSpans(ScopeSpans.newBuilder()
+                    .setScope(InstrumentationScope.newBuilder()
+                        .setName(scopeName)
+                        .setVersion("1.0")
+                        .build())
+                    .addSpans(spanBuilder.build())
+                    .build())
+                .build())
+            .build();
     }
 }

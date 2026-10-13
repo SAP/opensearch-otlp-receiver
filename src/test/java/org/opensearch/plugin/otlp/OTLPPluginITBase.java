@@ -12,58 +12,45 @@ package org.opensearch.plugin.otlp;
 
 import com.carrotsearch.randomizedtesting.ThreadFilter;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
-import io.opentelemetry.exporter.otlp.logs.OtlpGrpcLogRecordExporter;
-import io.opentelemetry.exporter.otlp.metrics.OtlpGrpcMetricExporter;
-import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
-import io.opentelemetry.exporter.otlp.http.logs.OtlpHttpLogRecordExporter;
-import io.opentelemetry.exporter.otlp.http.metrics.OtlpHttpMetricExporter;
-import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.sdk.logs.export.LogRecordExporter;
-import io.opentelemetry.sdk.metrics.export.MetricExporter;
-import io.opentelemetry.sdk.resources.Resource;
-import io.opentelemetry.sdk.trace.export.SpanExporter;
+import io.grpc.stub.StreamObserver;
+import io.opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest;
+import io.opentelemetry.proto.collector.logs.v1.ExportLogsServiceResponse;
+import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
+import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
+import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest;
+import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceResponse;
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.plugin.otlp.index.BulkIndexer;
+import org.opensearch.plugin.otlp.server.OTLPLogsGrpcService;
+import org.opensearch.plugin.otlp.server.OTLPMetricsGrpcService;
+import org.opensearch.plugin.otlp.server.OTLPTraceGrpcService;
+import org.opensearch.plugin.otlp.server.RetryInfoCalculator;
+import org.opensearch.plugin.otlp.transform.LogsTransformer;
+import org.opensearch.plugin.otlp.transform.MetricsTransformer;
+import org.opensearch.plugin.otlp.transform.TraceTransformer;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 @ThreadLeakFilters(filters = OTLPPluginITBase.KnownThreadFilter.class)
 public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
 
-    // Ephemeral ports allocated once for the whole JVM run to avoid port conflicts
-    // between test classes that run sequentially in the same JVM.
-    static final int OTLP_HTTP_PORT = allocateFreePort();
-    static final int OTLP_GRPC_PORT = allocateFreePort();
+    static final String TRACES_INDEX  = "otel-v1-apm-span-test";
+    static final String LOGS_INDEX    = "logs-otel-v1-test";
+    static final String METRICS_INDEX = "metrics-otel-v1-test";
 
-    protected enum OtlpProtocol { GRPC, HTTP_PROTOBUF, HTTP_JSON }
-
-    // Shared HTTP client for the hand-rolled HTTP/JSON transport.
-    // The SDK does not expose http/json via a public builder API in 1.47.0;
-    // gRPC and HTTP/proto use the OTel SDK exporters.
-    private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
-
-    private static int allocateFreePort() {
-        try (ServerSocket s = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            return s.getLocalPort();
-        } catch (IOException e) {
-            throw new RuntimeException("Cannot allocate ephemeral port", e);
-        }
-    }
+    protected OTLPTraceGrpcService   traceService;
+    protected OTLPMetricsGrpcService metricsService;
+    protected OTLPLogsGrpcService    logsService;
 
     @Override
     protected Collection<Class<? extends Plugin>> getPlugins() {
@@ -74,17 +61,13 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
     protected Settings nodeSettings() {
         return Settings.builder()
             .put(super.nodeSettings())
-            .put("plugins.otlp.http.port", OTLP_HTTP_PORT)
-            .put("plugins.otlp.port", OTLP_GRPC_PORT)
             .put("plugins.otlp.index.create_templates", true)
-            .put("plugins.otlp.traces.index",  "otel-v1-apm-span-test")
-            .put("plugins.otlp.logs.index",    "logs-otel-v1-test")
-            .put("plugins.otlp.metrics.index", "metrics-otel-v1-test")
+            .put("plugins.otlp.traces.index",  TRACES_INDEX)
+            .put("plugins.otlp.logs.index",    LOGS_INDEX)
+            .put("plugins.otlp.metrics.index", METRICS_INDEX)
             .build();
     }
 
-    // The node is shared across all test methods in a class; only the test index
-    // is deleted between tests so each method starts with a clean slate.
     @Override
     protected boolean resetNodeAfterTest() {
         return false;
@@ -93,8 +76,15 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
     @Override
     public void setUp() throws Exception {
         super.setUp();
-        // Wait for the async IndexTemplateManager to install all three composable templates.
-        // This only blocks on the first test in each class; subsequent tests find them instantly.
+
+        // Wire service instances directly against the embedded OpenSearch client.
+        // This exercises the transformer + indexer pipeline without a gRPC network connection.
+        BulkIndexer indexer = new BulkIndexer(client(), 64, false, null);
+        RetryInfoCalculator retryCalc = new RetryInfoCalculator(Duration.ofMillis(100), Duration.ofSeconds(2));
+        traceService   = new OTLPTraceGrpcService  (indexer, new TraceTransformer(),   retryCalc, TRACES_INDEX);
+        metricsService = new OTLPMetricsGrpcService(indexer, new MetricsTransformer(), retryCalc, METRICS_INDEX);
+        logsService    = new OTLPLogsGrpcService   (indexer, new LogsTransformer(),    retryCalc, LOGS_INDEX);
+
         assertBusy(() -> {
             var templates = getInstanceFromNode(org.opensearch.cluster.service.ClusterService.class)
                 .state().metadata().templatesV2();
@@ -111,79 +101,35 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
     }
 
     private void deleteTestIndices() {
-        String[] indices = {"otel-v1-apm-span-test", "logs-otel-v1-test", "metrics-otel-v1-test"};
-        for (String index : indices) {
+        for (String index : new String[]{ TRACES_INDEX, LOGS_INDEX, METRICS_INDEX,
+                "otel-v1-apm-service-map-test" }) {
             try {
                 client().admin().indices().delete(new DeleteIndexRequest(index)).actionGet();
-            } catch (Exception ignored) {
-                // index may not exist if the test did not create it
-            }
+            } catch (Exception ignored) {}
         }
     }
 
-    // ── OTel SDK exporter builders (gRPC and HTTP/protobuf only) ─────────────────
-    // HTTP/JSON is handled by sendJsonOTLP below — the OTel SDK 1.47.0 does not
-    // expose http/json via a public builder API.
+    // ── gRPC export helpers ───────────────────────────────────────────────────
 
-    protected SpanExporter buildSpanExporter(OtlpProtocol protocol) {
-        String httpEndpoint = "http://localhost:" + OTLP_HTTP_PORT;
-        String grpcEndpoint = "http://localhost:" + OTLP_GRPC_PORT;
-        switch (protocol) {
-            case GRPC:
-                return OtlpGrpcSpanExporter.builder().setEndpoint(grpcEndpoint).build();
-            case HTTP_PROTOBUF:
-                return OtlpHttpSpanExporter.builder().setEndpoint(httpEndpoint + "/v1/traces").build();
-            default:
-                throw new IllegalArgumentException("Use sendJsonOTLP for HTTP_JSON");
-        }
+    protected void export(ExportTraceServiceRequest request) throws Exception {
+        SyncObserver<ExportTraceServiceResponse> obs = new SyncObserver<>();
+        traceService.export(request, obs);
+        obs.await();
     }
 
-    protected MetricExporter buildMetricExporter(OtlpProtocol protocol) {
-        String httpEndpoint = "http://localhost:" + OTLP_HTTP_PORT;
-        String grpcEndpoint = "http://localhost:" + OTLP_GRPC_PORT;
-        switch (protocol) {
-            case GRPC:
-                return OtlpGrpcMetricExporter.builder().setEndpoint(grpcEndpoint).build();
-            case HTTP_PROTOBUF:
-                return OtlpHttpMetricExporter.builder().setEndpoint(httpEndpoint + "/v1/metrics").build();
-            default:
-                throw new IllegalArgumentException("Use sendJsonOTLP for HTTP_JSON");
-        }
+    protected void export(ExportMetricsServiceRequest request) throws Exception {
+        SyncObserver<ExportMetricsServiceResponse> obs = new SyncObserver<>();
+        metricsService.export(request, obs);
+        obs.await();
     }
 
-    protected LogRecordExporter buildLogExporter(OtlpProtocol protocol) {
-        String httpEndpoint = "http://localhost:" + OTLP_HTTP_PORT;
-        String grpcEndpoint = "http://localhost:" + OTLP_GRPC_PORT;
-        switch (protocol) {
-            case GRPC:
-                return OtlpGrpcLogRecordExporter.builder().setEndpoint(grpcEndpoint).build();
-            case HTTP_PROTOBUF:
-                return OtlpHttpLogRecordExporter.builder().setEndpoint(httpEndpoint + "/v1/logs").build();
-            default:
-                throw new IllegalArgumentException("Use sendJsonOTLP for HTTP_JSON");
-        }
+    protected void export(ExportLogsServiceRequest request) throws Exception {
+        SyncObserver<ExportLogsServiceResponse> obs = new SyncObserver<>();
+        logsService.export(request, obs);
+        obs.await();
     }
 
-    protected static Resource telemetryResource(String serviceName) {
-        return Resource.builder()
-            .put(AttributeKey.stringKey("service.name"), serviceName)
-            .build();
-    }
-
-    // ── HTTP/JSON transport (hand-rolled, SDK does not expose this protocol) ──────
-
-    protected void sendJsonOTLP(String path, String json) throws IOException, InterruptedException {
-        HttpRequest req = HttpRequest.newBuilder()
-            .uri(URI.create("http://localhost:" + OTLP_HTTP_PORT + path))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(json))
-            .build();
-        HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
-        assertEquals("HTTP/JSON 200 expected for " + path + ", body: " + resp.body(),
-            200, resp.statusCode());
-    }
-
-    // ── OpenSearch helpers ────────────────────────────────────────────────────────
+    // ── OpenSearch helpers ────────────────────────────────────────────────────
 
     protected void refresh(String index) {
         client().admin().indices().refresh(new RefreshRequest(index)).actionGet();
@@ -200,21 +146,31 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
         assertEquals("Wrong type for '" + field + "'", expectedType, fieldMapping.get("type"));
     }
 
-    // ── Thread leak suppression ──────────────────────────────────────────────────
+    // ── Synchronous StreamObserver ────────────────────────────────────────────
 
-    // Suppresses Armeria's NIO worker threads, OkHttp/gRPC background threads,
-    // JDK HttpClient I/O threads, and the JDK's common ForkJoinPool workers,
-    // all of which are long-lived background infrastructure that outlive individual test suites.
+    public static class SyncObserver<T> implements StreamObserver<T> {
+        private volatile Throwable error;
+        private final CountDownLatch latch = new CountDownLatch(1);
+
+        @Override public void onNext(T value) {}
+        @Override public void onCompleted() { latch.countDown(); }
+        @Override public void onError(Throwable t) { error = t; latch.countDown(); }
+
+        public void await() throws Exception {
+            assertTrue("gRPC export timed out after 10 s", latch.await(10, TimeUnit.SECONDS));
+            if (error != null) {
+                throw new RuntimeException("gRPC export failed: " + error.getMessage(), error);
+            }
+        }
+    }
+
+    // ── Thread leak suppression ───────────────────────────────────────────────
+
     public static final class KnownThreadFilter implements ThreadFilter {
         @Override
         public boolean reject(Thread t) {
             String name = t.getName();
-            return name.startsWith("armeria-")
-                || name.startsWith("OkHttp")
-                || name.equals("Okio Watchdog")
-                || name.startsWith("grpc-")
-                || name.startsWith("HttpClient-")
-                || name.startsWith("ForkJoinPool.commonPool-")
+            return name.startsWith("ForkJoinPool.commonPool-")
                 || name.startsWith("startstop-");
         }
     }

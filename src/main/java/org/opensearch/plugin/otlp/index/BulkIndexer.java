@@ -46,10 +46,15 @@ public class BulkIndexer {
         this.client = client;
         this.inflightSemaphore = new Semaphore(maxInflight);
         this.requireAlias = requireAlias;
-        this.rejectedRequestsCounter = metricsRegistry.createCounter(
-            "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
-        this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(
-            "otlp.inflight_requests", "Current number of in-flight bulk index requests", "1");
+        if (metricsRegistry != null) {
+            this.rejectedRequestsCounter = metricsRegistry.createCounter(
+                "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
+            this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(
+                "otlp.inflight_requests", "Current number of in-flight bulk index requests", "1");
+        } else {
+            this.rejectedRequestsCounter = null;
+            this.inflightRequestsCounter = null;
+        }
     }
 
     public CompletableFuture<BulkResponse> index(String index, List<? extends ToXContent> docs) {
@@ -57,11 +62,11 @@ public class BulkIndexer {
             return CompletableFuture.completedFuture(null);
         }
         if (!inflightSemaphore.tryAcquire()) {
-            rejectedRequestsCounter.add(1.0);
+            if (rejectedRequestsCounter != null) rejectedRequestsCounter.add(1.0);
             return CompletableFuture.failedFuture(
                 new OpenSearchRejectedExecutionException("OTLP max_inflight_requests limit reached"));
         }
-        inflightRequestsCounter.add(1.0);
+        if (inflightRequestsCounter != null) inflightRequestsCounter.add(1.0);
 
         BulkRequest bulkRequest = new BulkRequest();
         for (ToXContent doc : docs) {
@@ -76,7 +81,7 @@ public class BulkIndexer {
                 bulkRequest.add(req);
             } catch (java.io.IOException e) {
                 inflightSemaphore.release();
-                inflightRequestsCounter.add(-1.0);
+                if (inflightRequestsCounter != null) inflightRequestsCounter.add(-1.0);
                 return CompletableFuture.failedFuture(e);
             }
         }
@@ -85,7 +90,7 @@ public class BulkIndexer {
             @Override
             public void onResponse(BulkResponse response) {
                 inflightSemaphore.release();
-                inflightRequestsCounter.add(-1.0);
+                if (inflightRequestsCounter != null) inflightRequestsCounter.add(-1.0);
                 if (response.hasFailures()) {
                     LOG.warn("Bulk index completed with failures: {}", response.buildFailureMessage());
                 }
@@ -94,7 +99,7 @@ public class BulkIndexer {
             @Override
             public void onFailure(Exception e) {
                 inflightSemaphore.release();
-                inflightRequestsCounter.add(-1.0);
+                if (inflightRequestsCounter != null) inflightRequestsCounter.add(-1.0);
                 future.completeExceptionally(e);
             }
         });

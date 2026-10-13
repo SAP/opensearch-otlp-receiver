@@ -12,8 +12,7 @@ services:
         hard: -1
     ports:
       - "9200:9200"
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
+      - "4317:4317"   # OTLP gRPC (transport-grpc)
     volumes:
       - ./opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
       - ../build/distributions/opensearch-otlp-receiver-0.2.0.zip:/tmp/opensearch-otlp-receiver.zip:ro
