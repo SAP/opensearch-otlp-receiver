@@ -5,11 +5,11 @@ discovery.type: single-node
 # Disable security for local testing
 plugins.security.disabled: true
 
+# gRPC transport — OpenSearch's built-in transport-grpc module receives OTLP on this port
+grpc.port: 4317
+
 # OTLP plugin settings
 plugins.otlp.enabled: true
-plugins.otlp.port: 4317
-plugins.otlp.http.port: 4318
-plugins.otlp.bind_host: "0.0.0.0"
 plugins.otlp.index.create_templates: true
 
 # Plugin logging

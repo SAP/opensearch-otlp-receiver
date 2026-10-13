@@ -23,15 +23,6 @@ public final class OTLPPluginSettings {
     public static final Setting<Boolean> ENABLED = Setting.boolSetting(
         "plugins.otlp.enabled", true, Setting.Property.NodeScope);
 
-    public static final Setting<Integer> GRPC_PORT = Setting.intSetting(
-        "plugins.otlp.port", 4317, 1, 65535, Setting.Property.NodeScope);
-
-    public static final Setting<Integer> HTTP_PORT = Setting.intSetting(
-        "plugins.otlp.http.port", 4318, 1, 65535, Setting.Property.NodeScope);
-
-    public static final Setting<String> BIND_HOST = Setting.simpleString(
-        "plugins.otlp.bind_host", "0.0.0.0", Setting.Property.NodeScope);
-
     public static final Setting<String> TRACES_INDEX = Setting.simpleString(
         "plugins.otlp.traces.index", "otel-v1-apm-span", Setting.Property.NodeScope);
 
@@ -43,15 +34,6 @@ public final class OTLPPluginSettings {
 
     public static final Setting<Boolean> CREATE_TEMPLATES = Setting.boolSetting(
         "plugins.otlp.index.create_templates", true, Setting.Property.NodeScope);
-
-    public static final Setting<Boolean> SSL_ENABLED = Setting.boolSetting(
-        "plugins.otlp.ssl.enabled", false, Setting.Property.NodeScope);
-
-    public static final Setting<String> SSL_CERTIFICATE = Setting.simpleString(
-        "plugins.otlp.ssl.certificate", Setting.Property.NodeScope);
-
-    public static final Setting<String> SSL_KEY = Setting.simpleString(
-        "plugins.otlp.ssl.key", Setting.Property.NodeScope);
 
     public static final Setting<Boolean> ENRICHMENT_ENABLED = Setting.boolSetting(
         "plugins.otlp.traces.enrichment.enabled", true, Setting.Property.NodeScope);
@@ -84,19 +66,13 @@ public final class OTLPPluginSettings {
     public static final Setting<Boolean> REQUIRE_ALIAS = Setting.boolSetting(
         "plugins.otlp.index.require_alias", false, Setting.Property.NodeScope);
 
-    public static final Setting<Integer> MAX_REQUEST_BYTES = Setting.intSetting(
-        "plugins.otlp.max_request_bytes", 4 * 1024 * 1024, 1, Setting.Property.NodeScope);
-
-    public static final Setting<Boolean> COMPRESSION_ENABLED = Setting.boolSetting(
-        "plugins.otlp.compression.enabled", true, Setting.Property.NodeScope);
-
     public static final List<Setting<?>> ALL = List.of(
-        ENABLED, GRPC_PORT, HTTP_PORT, BIND_HOST,
+        ENABLED,
         TRACES_INDEX, LOGS_INDEX, METRICS_INDEX,
-        CREATE_TEMPLATES, SSL_ENABLED, SSL_CERTIFICATE, SSL_KEY,
+        CREATE_TEMPLATES,
         ENRICHMENT_ENABLED, ENRICHMENT_INTERVAL, ENRICHMENT_LOOKBACK_WINDOW,
         ENRICHMENT_TRACE_CUTOFF, ENRICHMENT_BATCH_SIZE,
         SERVICE_MAP_INDEX, SERVICE_MAP_INTERVAL,
-        MAX_INFLIGHT_REQUESTS, REQUIRE_ALIAS, MAX_REQUEST_BYTES, COMPRESSION_ENABLED
+        MAX_INFLIGHT_REQUESTS, REQUIRE_ALIAS
     );
 }

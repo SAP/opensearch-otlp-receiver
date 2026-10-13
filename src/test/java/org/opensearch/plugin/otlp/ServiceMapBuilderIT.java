@@ -10,12 +10,8 @@
  */
 package org.opensearch.plugin.otlp;
 
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.context.Context;
-import io.opentelemetry.sdk.trace.SdkTracerProvider;
-import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import com.google.protobuf.ByteString;
+import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
 import org.opensearch.search.SearchHit;
@@ -29,13 +25,24 @@ import java.util.concurrent.TimeUnit;
  */
 public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
-    private static final String TRACES_INDEX = "otel-v1-apm-span-test";
     private static final String SERVICE_MAP_INDEX = "otel-v1-apm-service-map-test";
+
+    private static final ByteString TRACE_ID = ByteString.copyFrom(
+        new byte[]{ 10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25 });
+    private static final ByteString ROOT_SPAN_ID = ByteString.copyFrom(
+        new byte[]{ 10,11,12,13,14,15,16,17 });
+    private static final ByteString CHILD_SPAN_ID = ByteString.copyFrom(
+        new byte[]{ 20,21,22,23,24,25,26,27 });
 
     // ── two-service trace produces two relationship docs ──────────────────────
 
     public void testTwoServicesProduceTwoRelationships() throws Exception {
-        emitTwoServiceTrace("GET /api", "frontend-svc", "backend-svc");
+        // Root span from frontend-svc (CLIENT)
+        export(OTLPTracesIT.traceRequest("frontend-svc", "parent-lib", "GET /api",
+            Span.SpanKind.SPAN_KIND_CLIENT, TRACE_ID, ROOT_SPAN_ID, null));
+        // Child span from backend-svc (SERVER, parent = root)
+        export(OTLPTracesIT.traceRequest("backend-svc", "child-lib", "child-op",
+            Span.SpanKind.SPAN_KIND_SERVER, TRACE_ID, CHILD_SPAN_ID, ROOT_SPAN_ID));
         refresh(TRACES_INDEX);
         assertEquals("two spans indexed", 2, searchAll(TRACES_INDEX).getHits().getTotalHits().value());
 
@@ -65,44 +72,5 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
             SERVICE_MAP_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
             new TimeValue(5, TimeUnit.MINUTES));
-    }
-
-    private void emitTwoServiceTrace(String rootSpanName, String parentService, String childService)
-            throws Exception {
-        var parentExporter = buildSpanExporter(OtlpProtocol.GRPC);
-        var parentProvider = SdkTracerProvider.builder()
-            .addSpanProcessor(SimpleSpanProcessor.create(parentExporter))
-            .setResource(telemetryResource(parentService))
-            .build();
-        var childExporter = buildSpanExporter(OtlpProtocol.GRPC);
-        var childProvider = SdkTracerProvider.builder()
-            .addSpanProcessor(SimpleSpanProcessor.create(childExporter))
-            .setResource(telemetryResource(childService))
-            .build();
-        try {
-            var parentTracer = parentProvider.get("parent-lib");
-            var childTracer = childProvider.get("child-lib");
-
-            Span root = parentTracer.spanBuilder(rootSpanName)
-                .setSpanKind(SpanKind.CLIENT)
-                .setNoParent()
-                .startSpan();
-            try (var scope = root.makeCurrent()) {
-                childTracer.spanBuilder("child-op")
-                    .setSpanKind(SpanKind.SERVER)
-                    .setParent(Context.current())
-                    .startSpan()
-                    .setStatus(StatusCode.OK)
-                    .end();
-            } finally {
-                root.setStatus(StatusCode.OK);
-                root.end();
-            }
-            parentProvider.forceFlush().join(10, TimeUnit.SECONDS);
-            childProvider.forceFlush().join(10, TimeUnit.SECONDS);
-        } finally {
-            parentProvider.shutdown().join(10, TimeUnit.SECONDS);
-            childProvider.shutdown().join(10, TimeUnit.SECONDS);
-        }
     }
 }

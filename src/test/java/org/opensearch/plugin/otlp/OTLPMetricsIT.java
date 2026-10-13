@@ -10,163 +10,64 @@
  */
 package org.opensearch.plugin.otlp;
 
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.sdk.metrics.SdkMeterProvider;
-import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
+import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
+import io.opentelemetry.proto.common.v1.AnyValue;
+import io.opentelemetry.proto.common.v1.InstrumentationScope;
+import io.opentelemetry.proto.common.v1.KeyValue;
+import io.opentelemetry.proto.metrics.v1.AggregationTemporality;
+import io.opentelemetry.proto.metrics.v1.Gauge;
+import io.opentelemetry.proto.metrics.v1.Histogram;
+import io.opentelemetry.proto.metrics.v1.HistogramDataPoint;
+import io.opentelemetry.proto.metrics.v1.Metric;
+import io.opentelemetry.proto.metrics.v1.NumberDataPoint;
+import io.opentelemetry.proto.metrics.v1.ResourceMetrics;
+import io.opentelemetry.proto.metrics.v1.ScopeMetrics;
+import io.opentelemetry.proto.metrics.v1.Sum;
+import io.opentelemetry.proto.resource.v1.Resource;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.search.SearchResponse;
 
-import java.time.Duration;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
- * End-to-end integration tests for OTLP metrics ingestion. Covers HTTP/JSON,
- * HTTP/protobuf, and gRPC transports. Mapping assertions target fields
- * defined in the ss4o_metrics composable template (metrics-otel-v1-*).
+ * End-to-end integration tests for OTLP metrics ingestion. Constructs OTLP
+ * proto requests and calls the service directly — no network connection needed.
  */
 public class OTLPMetricsIT extends OTLPPluginITBase {
 
-    // Matches the ss4o_metrics template pattern "metrics-otel-v1-*".
-    private static final String INDEX = "metrics-otel-v1-test";
+    // ── Gauge tests ───────────────────────────────────────────────────────────
 
-    // ── JSON payloads for HTTP/JSON transport ─────────────────────────────────────
-
-    private static final String GAUGE_JSON = "{\n"
-        + "  \"resourceMetrics\": [{\n"
-        + "    \"resource\": {\"attributes\": [{\"key\": \"service.name\","
-        +      " \"value\": {\"stringValue\": \"metric-svc\"}}]},\n"
-        + "    \"scopeMetrics\": [{\n"
-        + "      \"scope\": {\"name\": \"metric-lib\"},\n"
-        + "      \"metrics\": [{\n"
-        + "        \"name\": \"cpu.usage\", \"description\": \"CPU usage fraction\","
-        +          " \"unit\": \"1\",\n"
-        + "        \"gauge\": {\"dataPoints\": [{\n"
-        + "          \"startTimeUnixNano\": \"1000000000\","
-        +            " \"timeUnixNano\": \"2000000000\",\n"
-        + "          \"asDouble\": 0.75,\n"
-        + "          \"attributes\": [{\"key\": \"host\","
-        +            " \"value\": {\"stringValue\": \"node-1\"}}]\n"
-        + "        }]}\n"
-        + "      }]\n"
-        + "    }]\n"
-        + "  }]\n"
-        + "}";
-
-    private static final String SUM_JSON = "{\n"
-        + "  \"resourceMetrics\": [{\n"
-        + "    \"resource\": {\"attributes\": [{\"key\": \"service.name\","
-        +      " \"value\": {\"stringValue\": \"metric-svc\"}}]},\n"
-        + "    \"scopeMetrics\": [{\n"
-        + "      \"scope\": {\"name\": \"metric-lib\"},\n"
-        + "      \"metrics\": [{\n"
-        + "        \"name\": \"req.count\", \"description\": \"Request counter\","
-        +          " \"unit\": \"1\",\n"
-        + "        \"sum\": {\n"
-        + "          \"isMonotonic\": true,\n"
-        + "          \"aggregationTemporality\": \"AGGREGATION_TEMPORALITY_CUMULATIVE\",\n"
-        + "          \"dataPoints\": [{\n"
-        + "            \"startTimeUnixNano\": \"1000000000\","
-        +              " \"timeUnixNano\": \"2000000000\",\n"
-        + "            \"asInt\": \"42\"\n"
-        + "          }]\n"
-        + "        }\n"
-        + "      }]\n"
-        + "    }]\n"
-        + "  }]\n"
-        + "}";
-
-    private static final String HISTOGRAM_JSON = "{\n"
-        + "  \"resourceMetrics\": [{\n"
-        + "    \"resource\": {\"attributes\": [{\"key\": \"service.name\","
-        +      " \"value\": {\"stringValue\": \"metric-svc\"}}]},\n"
-        + "    \"scopeMetrics\": [{\n"
-        + "      \"scope\": {\"name\": \"metric-lib\"},\n"
-        + "      \"metrics\": [{\n"
-        + "        \"name\": \"latency\", \"description\": \"Request latency\","
-        +          " \"unit\": \"ms\",\n"
-        + "        \"histogram\": {\n"
-        + "          \"aggregationTemporality\": \"AGGREGATION_TEMPORALITY_CUMULATIVE\",\n"
-        + "          \"dataPoints\": [{\n"
-        + "            \"startTimeUnixNano\": \"1000000000\","
-        +              " \"timeUnixNano\": \"2000000000\",\n"
-        + "            \"count\": \"2\", \"sum\": 550.0,\n"
-        + "            \"bucketCounts\": [\"0\", \"1\", \"1\", \"0\"],\n"
-        + "            \"explicitBounds\": [10.0, 100.0, 1000.0]\n"
-        + "          }]\n"
-        + "        }\n"
-        + "      }]\n"
-        + "    }]\n"
-        + "  }]\n"
-        + "}";
-
-    // ── Gauge tests ───────────────────────────────────────────────────────────────
-
-    public void testGauge_httpJson() throws Exception {
-        sendJsonOTLP("/v1/metrics", GAUGE_JSON);
-        assertGaugeDocument(INDEX);
+    public void testGauge() throws Exception {
+        export(gaugeRequest("metric-svc", "metric-lib"));
+        assertGaugeDocument(METRICS_INDEX);
     }
 
-    public void testGauge_httpProto() throws Exception {
-        emitGauge(OtlpProtocol.HTTP_PROTOBUF);
-        assertGaugeDocument(INDEX);
+    // ── Counter (Sum) tests ───────────────────────────────────────────────────
+
+    public void testSum() throws Exception {
+        export(sumRequest("metric-svc", "metric-lib"));
+        assertSumDocument(METRICS_INDEX);
     }
 
-    public void testGauge_grpc() throws Exception {
-        emitGauge(OtlpProtocol.GRPC);
-        assertGaugeDocument(INDEX);
+    // ── Histogram tests ───────────────────────────────────────────────────────
+
+    public void testHistogram() throws Exception {
+        export(histogramRequest("metric-svc", "metric-lib"));
+        assertHistogramDocument(METRICS_INDEX);
     }
 
-    // ── Counter (Sum) tests ───────────────────────────────────────────────────────
-
-    public void testSum_httpJson() throws Exception {
-        sendJsonOTLP("/v1/metrics", SUM_JSON);
-        assertSumDocument(INDEX);
-    }
-
-    public void testSum_httpProto() throws Exception {
-        emitCounter(OtlpProtocol.HTTP_PROTOBUF);
-        assertSumDocument(INDEX);
-    }
-
-    public void testSum_grpc() throws Exception {
-        emitCounter(OtlpProtocol.GRPC);
-        assertSumDocument(INDEX);
-    }
-
-    // ── Histogram tests ───────────────────────────────────────────────────────────
-
-    public void testHistogram_httpJson() throws Exception {
-        sendJsonOTLP("/v1/metrics", HISTOGRAM_JSON);
-        assertHistogramDocument(INDEX);
-    }
-
-    public void testHistogram_httpProto() throws Exception {
-        emitHistogram(OtlpProtocol.HTTP_PROTOBUF);
-        assertHistogramDocument(INDEX);
-    }
-
-    public void testHistogram_grpc() throws Exception {
-        emitHistogram(OtlpProtocol.GRPC);
-        assertHistogramDocument(INDEX);
-    }
-
-    // ── Mapping: fields from the ss4o_metrics composable template ────────────────
+    // ── Mapping tests ─────────────────────────────────────────────────────────
 
     public void testMetricMappingTypes() throws Exception {
-        emitGauge(OtlpProtocol.GRPC);
-        refresh(INDEX);
+        export(gaugeRequest("metric-svc", "metric-lib"));
+        refresh(METRICS_INDEX);
 
         GetMappingsResponse resp = client().admin().indices()
-            .prepareGetMappings(INDEX).get();
+            .prepareGetMappings(METRICS_INDEX).get();
         @SuppressWarnings("unchecked")
         Map<String, Object> props = (Map<String, Object>)
-            ((Map<String, Object>) resp.getMappings().get(INDEX).sourceAsMap().get("properties"));
+            ((Map<String, Object>) resp.getMappings().get(METRICS_INDEX).sourceAsMap().get("properties"));
 
-        // Fields defined in the ss4o_metrics template.
         assertMappingType(props, "name",      "keyword");
         assertMappingType(props, "kind",      "keyword");
         assertMappingType(props, "unit",      "keyword");
@@ -175,72 +76,7 @@ public class OTLPMetricsIT extends OTLPPluginITBase {
         assertMappingType(props, "time",      "date_nanos");
     }
 
-    // ── signal emission ───────────────────────────────────────────────────────────
-
-    private void emitGauge(OtlpProtocol protocol) throws Exception {
-        var exporter = buildMetricExporter(protocol);
-        var reader = PeriodicMetricReader.builder(exporter)
-            .setInterval(Duration.ofHours(1))
-            .build();
-        var provider = SdkMeterProvider.builder()
-            .registerMetricReader(reader)
-            .setResource(telemetryResource("metric-svc"))
-            .build();
-        try {
-            provider.get("metric-lib")
-                .gaugeBuilder("cpu.usage")
-                .setDescription("CPU usage fraction")
-                .setUnit("1")
-                .buildWithCallback(m -> m.record(0.75, Attributes.of(AttributeKey.stringKey("host"), "node-1")));
-        } finally {
-            provider.shutdown().join(10, TimeUnit.SECONDS);
-        }
-    }
-
-    private void emitCounter(OtlpProtocol protocol) throws Exception {
-        var exporter = buildMetricExporter(protocol);
-        var reader = PeriodicMetricReader.builder(exporter)
-            .setInterval(Duration.ofHours(1))
-            .build();
-        var provider = SdkMeterProvider.builder()
-            .registerMetricReader(reader)
-            .setResource(telemetryResource("metric-svc"))
-            .build();
-        try {
-            LongCounter counter = provider.get("metric-lib")
-                .counterBuilder("req.count")
-                .setDescription("Request counter")
-                .setUnit("1")
-                .build();
-            counter.add(42);
-        } finally {
-            provider.shutdown().join(10, TimeUnit.SECONDS);
-        }
-    }
-
-    private void emitHistogram(OtlpProtocol protocol) throws Exception {
-        var exporter = buildMetricExporter(protocol);
-        var reader = PeriodicMetricReader.builder(exporter)
-            .setInterval(Duration.ofHours(1))
-            .build();
-        var provider = SdkMeterProvider.builder()
-            .registerMetricReader(reader)
-            .setResource(telemetryResource("metric-svc"))
-            .build();
-        try {
-            DoubleHistogram histogram = provider.get("metric-lib")
-                .histogramBuilder("latency")
-                .setDescription("Request latency")
-                .setUnit("ms")
-                .build();
-            histogram.record(50.0);
-            histogram.record(500.0);
-        } finally {
-            provider.shutdown().join(10, TimeUnit.SECONDS);
-        }
-    }
-
-    // ── shared document assertions ────────────────────────────────────────────────
+    // ── document assertions ───────────────────────────────────────────────────
 
     private void assertGaugeDocument(String index) {
         refresh(index);
@@ -250,7 +86,7 @@ public class OTLPMetricsIT extends OTLPPluginITBase {
         Map<String, Object> src = resp.getHits().getHits()[0].getSourceAsMap();
         assertEquals("cpu.usage",  src.get("name"));
         assertEquals("Gauge",      src.get("kind"));
-        assertEquals(0.75, (Double) src.get("value@double"), 1e-9);
+        assertEquals(0.75, (Double) src.get("value"), 1e-9);
         assertEquals("metric-svc", src.get("serviceName"));
 
         @SuppressWarnings("unchecked")
@@ -284,5 +120,100 @@ public class OTLPMetricsIT extends OTLPPluginITBase {
         assertEquals(2L, ((Number) src.get("count")).longValue());
         assertEquals(550.0, (Double) src.get("sum"), 1e-9);
         assertEquals("AGGREGATION_TEMPORALITY_CUMULATIVE", src.get("aggregationTemporality"));
+    }
+
+    // ── proto builder helpers ─────────────────────────────────────────────────
+
+    private static Resource resource(String serviceName) {
+        return Resource.newBuilder()
+            .addAttributes(KeyValue.newBuilder()
+                .setKey("service.name")
+                .setValue(AnyValue.newBuilder().setStringValue(serviceName).build())
+                .build())
+            .build();
+    }
+
+    static ExportMetricsServiceRequest gaugeRequest(String serviceName, String scopeName) {
+        return ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(ResourceMetrics.newBuilder()
+                .setResource(resource(serviceName))
+                .addScopeMetrics(ScopeMetrics.newBuilder()
+                    .setScope(InstrumentationScope.newBuilder().setName(scopeName).build())
+                    .addMetrics(Metric.newBuilder()
+                        .setName("cpu.usage")
+                        .setDescription("CPU usage fraction")
+                        .setUnit("1")
+                        .setGauge(Gauge.newBuilder()
+                            .addDataPoints(NumberDataPoint.newBuilder()
+                                .setStartTimeUnixNano(1_000_000_000L)
+                                .setTimeUnixNano(2_000_000_000L)
+                                .setAsDouble(0.75)
+                                .addAttributes(KeyValue.newBuilder()
+                                    .setKey("host")
+                                    .setValue(AnyValue.newBuilder()
+                                        .setStringValue("node-1").build())
+                                    .build())
+                                .build())
+                            .build())
+                        .build())
+                    .build())
+                .build())
+            .build();
+    }
+
+    static ExportMetricsServiceRequest sumRequest(String serviceName, String scopeName) {
+        return ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(ResourceMetrics.newBuilder()
+                .setResource(resource(serviceName))
+                .addScopeMetrics(ScopeMetrics.newBuilder()
+                    .setScope(InstrumentationScope.newBuilder().setName(scopeName).build())
+                    .addMetrics(Metric.newBuilder()
+                        .setName("req.count")
+                        .setDescription("Request counter")
+                        .setUnit("1")
+                        .setSum(Sum.newBuilder()
+                            .setIsMonotonic(true)
+                            .setAggregationTemporality(
+                                AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE)
+                            .addDataPoints(NumberDataPoint.newBuilder()
+                                .setStartTimeUnixNano(1_000_000_000L)
+                                .setTimeUnixNano(2_000_000_000L)
+                                .setAsInt(42L)
+                                .build())
+                            .build())
+                        .build())
+                    .build())
+                .build())
+            .build();
+    }
+
+    static ExportMetricsServiceRequest histogramRequest(String serviceName, String scopeName) {
+        return ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(ResourceMetrics.newBuilder()
+                .setResource(resource(serviceName))
+                .addScopeMetrics(ScopeMetrics.newBuilder()
+                    .setScope(InstrumentationScope.newBuilder().setName(scopeName).build())
+                    .addMetrics(Metric.newBuilder()
+                        .setName("latency")
+                        .setDescription("Request latency")
+                        .setUnit("ms")
+                        .setHistogram(Histogram.newBuilder()
+                            .setAggregationTemporality(
+                                AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE)
+                            .addDataPoints(HistogramDataPoint.newBuilder()
+                                .setStartTimeUnixNano(1_000_000_000L)
+                                .setTimeUnixNano(2_000_000_000L)
+                                .setCount(2)
+                                .setSum(550.0)
+                                .addBucketCounts(0).addBucketCounts(1)
+                                .addBucketCounts(1).addBucketCounts(0)
+                                .addExplicitBounds(10.0).addExplicitBounds(100.0)
+                                .addExplicitBounds(1000.0)
+                                .build())
+                            .build())
+                        .build())
+                    .build())
+                .build())
+            .build();
     }
 }

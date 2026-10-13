@@ -10,12 +10,8 @@
  */
 package org.opensearch.plugin.otlp;
 
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.context.Context;
-import io.opentelemetry.sdk.trace.SdkTracerProvider;
-import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import com.google.protobuf.ByteString;
+import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
@@ -31,19 +27,24 @@ import java.util.concurrent.TimeUnit;
  */
 public class TraceGroupEnricherIT extends OTLPPluginITBase {
 
-    private static final String INDEX = "otel-v1-apm-span-test";
+    private static final ByteString TRACE_ID = ByteString.copyFrom(
+        new byte[]{ 20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35 });
+    private static final ByteString ROOT_SPAN_ID = ByteString.copyFrom(
+        new byte[]{ 20,21,22,23,24,25,26,27 });
+    private static final ByteString CHILD_SPAN_ID = ByteString.copyFrom(
+        new byte[]{ 30,31,32,33,34,35,36,37 });
 
     // ── propagation: root and child span get traceGroup + traceGroupFields ────
 
     public void testEnrichmentPopulatesTraceGroupOnAllSpans() throws Exception {
         emitTrace("GET /orders");
-        refresh(INDEX);
-        assertEquals("both spans indexed", 2, searchAll(INDEX).getHits().getTotalHits().value());
+        refresh(TRACES_INDEX);
+        assertEquals("both spans indexed", 2, searchAll(TRACES_INDEX).getHits().getTotalHits().value());
 
         enricher().runEnrichment();
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
 
-        for (SearchHit hit : searchAll(INDEX).getHits().getHits()) {
+        for (SearchHit hit : searchAll(TRACES_INDEX).getHits().getHits()) {
             Map<String, Object> src = hit.getSourceAsMap();
             assertEquals("traceGroup must be root span name",
                 "GET /orders", src.get("traceGroup"));
@@ -61,12 +62,12 @@ public class TraceGroupEnricherIT extends OTLPPluginITBase {
 
     public void testEnrichmentUsesRootSpanFieldsNotChildFields() throws Exception {
         emitTrace("POST /checkout");
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
         enricher().runEnrichment();
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
 
         SearchHit rootHit = null, childHit = null;
-        for (SearchHit hit : searchAll(INDEX).getHits().getHits()) {
+        for (SearchHit hit : searchAll(TRACES_INDEX).getHits().getHits()) {
             Map<String, Object> src = hit.getSourceAsMap();
             if (src.containsKey("parentSpanId")) {
                 childHit = hit;
@@ -93,7 +94,7 @@ public class TraceGroupEnricherIT extends OTLPPluginITBase {
     // ── cut-off: spans older than traceCutoff with no root get sentinel ───────
 
     public void testEnrichmentMarksSentinelForOrphanedSpans() throws Exception {
-        client().index(new IndexRequest(INDEX)
+        client().index(new IndexRequest(TRACES_INDEX)
             .id("orphantrace/orphanspan")
             .source(Map.of(
                 "traceId", "deadbeefdeadbeef00000000deadbeef",
@@ -105,21 +106,20 @@ public class TraceGroupEnricherIT extends OTLPPluginITBase {
                 "durationInNanos", 1_000_000_000L
             ), XContentType.JSON)
         ).actionGet();
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
 
-        // Use a very short cutoff (1s) so the year-2000 span falls past it
         TraceGroupEnricher enricher = new TraceGroupEnricher(
             client(), getInstanceFromNode(org.opensearch.threadpool.ThreadPool.class),
-            INDEX,
+            TRACES_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
             new TimeValue(5, TimeUnit.MINUTES),
             new TimeValue(1, TimeUnit.SECONDS),
             1000);
 
         enricher.runEnrichment();
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
 
-        SearchHit orphan = searchAll(INDEX).getHits().getHits()[0];
+        SearchHit orphan = searchAll(TRACES_INDEX).getHits().getHits()[0];
         assertEquals("orphaned span gets empty sentinel traceGroup",
             "", orphan.getSourceAsMap().get("traceGroup"));
     }
@@ -128,13 +128,13 @@ public class TraceGroupEnricherIT extends OTLPPluginITBase {
 
     public void testEnrichmentIsIdempotent() throws Exception {
         emitTrace("GET /items");
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
         TraceGroupEnricher enricher = enricher();
         enricher.runEnrichment();
         enricher.runEnrichment();
-        refresh(INDEX);
+        refresh(TRACES_INDEX);
 
-        for (SearchHit hit : searchAll(INDEX).getHits().getHits()) {
+        for (SearchHit hit : searchAll(TRACES_INDEX).getHits().getHits()) {
             assertEquals("GET /items", hit.getSourceAsMap().get("traceGroup"));
         }
     }
@@ -145,43 +145,19 @@ public class TraceGroupEnricherIT extends OTLPPluginITBase {
         return new TraceGroupEnricher(
             client(),
             getInstanceFromNode(org.opensearch.threadpool.ThreadPool.class),
-            INDEX,
+            TRACES_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
             new TimeValue(5, TimeUnit.MINUTES),
             new TimeValue(10, TimeUnit.MINUTES),
             1000);
     }
 
-    /**
-     * Emits a root span with the given name and a child span linked to it,
-     * both sharing the same traceId generated by the OTel SDK.
-     */
     private void emitTrace(String rootSpanName) throws Exception {
-        var exporter = buildSpanExporter(OtlpProtocol.GRPC);
-        var provider = SdkTracerProvider.builder()
-            .addSpanProcessor(SimpleSpanProcessor.create(exporter))
-            .setResource(telemetryResource("enricher-svc"))
-            .build();
-        try {
-            var tracer = provider.get("enricher-lib");
-            Span root = tracer.spanBuilder(rootSpanName)
-                .setSpanKind(SpanKind.SERVER)
-                .setNoParent()
-                .startSpan();
-            try (var scope = root.makeCurrent()) {
-                tracer.spanBuilder("child-op")
-                    .setSpanKind(SpanKind.CLIENT)
-                    .setParent(Context.current())
-                    .startSpan()
-                    .setStatus(StatusCode.OK)
-                    .end();
-            } finally {
-                root.setStatus(StatusCode.OK);
-                root.end();
-            }
-            provider.forceFlush().join(10, TimeUnit.SECONDS);
-        } finally {
-            provider.shutdown().join(10, TimeUnit.SECONDS);
-        }
+        // Root span (SERVER, no parent)
+        export(OTLPTracesIT.traceRequest("enricher-svc", "enricher-lib", rootSpanName,
+            Span.SpanKind.SPAN_KIND_SERVER, TRACE_ID, ROOT_SPAN_ID, null));
+        // Child span (CLIENT, parent = root)
+        export(OTLPTracesIT.traceRequest("enricher-svc", "enricher-lib", "child-op",
+            Span.SpanKind.SPAN_KIND_CLIENT, TRACE_ID, CHILD_SPAN_ID, ROOT_SPAN_ID));
     }
 }
