@@ -18,17 +18,9 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
-import org.opensearch.plugin.otlp.index.BulkIndexer;
 import org.opensearch.plugin.otlp.index.IndexTemplateManager;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricher;
-import org.opensearch.plugin.otlp.server.OTLPGrpcService;
-import org.opensearch.plugin.otlp.server.OTLPHttpHandler;
-import org.opensearch.plugin.otlp.server.OTLPServer;
-import org.opensearch.plugin.otlp.server.RetryInfoCalculator;
-import org.opensearch.plugin.otlp.transform.LogsTransformer;
-import org.opensearch.plugin.otlp.transform.MetricsTransformer;
-import org.opensearch.plugin.otlp.transform.TraceTransformer;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.TelemetryAwarePlugin;
 import org.opensearch.repositories.RepositoriesService;
@@ -39,7 +31,6 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -73,49 +64,14 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
             return List.of();
         }
 
-        String tracesIndex  = OTLPPluginSettings.TRACES_INDEX.get(settings);
-        String logsIndex    = OTLPPluginSettings.LOGS_INDEX.get(settings);
-        String metricsIndex = OTLPPluginSettings.METRICS_INDEX.get(settings);
-
-        TraceTransformer traceTransformer      = new TraceTransformer();
-        LogsTransformer logsTransformer        = new LogsTransformer();
-        MetricsTransformer metricsTransformer  = new MetricsTransformer();
-        BulkIndexer bulkIndexer = new BulkIndexer(
-            client,
-            OTLPPluginSettings.MAX_INFLIGHT_REQUESTS.get(settings),
-            OTLPPluginSettings.REQUIRE_ALIAS.get(settings),
-            metricsRegistry);
-
-        OTLPGrpcService grpcService = new OTLPGrpcService(
-            traceTransformer, logsTransformer, metricsTransformer,
-            bulkIndexer, tracesIndex, logsIndex, metricsIndex);
-
-        RetryInfoCalculator retryInfoCalculator = new RetryInfoCalculator(
-            Duration.ofMillis(100), Duration.ofSeconds(2));
-
-        OTLPHttpHandler httpHandler = new OTLPHttpHandler(
-            traceTransformer, logsTransformer, metricsTransformer,
-            bulkIndexer, tracesIndex, logsIndex, metricsIndex,
-            retryInfoCalculator);
-
-        OTLPServer server = new OTLPServer(
-            grpcService, httpHandler,
-            OTLPPluginSettings.BIND_HOST.get(settings),
-            OTLPPluginSettings.GRPC_PORT.get(settings),
-            OTLPPluginSettings.HTTP_PORT.get(settings),
-            OTLPPluginSettings.MAX_REQUEST_BYTES.get(settings),
-            OTLPPluginSettings.COMPRESSION_ENABLED.get(settings),
-            retryInfoCalculator);
-
         List<Object> components = new ArrayList<>();
-        components.add(server);
-        components.add(bulkIndexer);
 
         if (OTLPPluginSettings.CREATE_TEMPLATES.get(settings)) {
             components.add(new IndexTemplateManager(client, clusterService));
         }
 
         if (OTLPPluginSettings.ENRICHMENT_ENABLED.get(settings)) {
+            String tracesIndex = OTLPPluginSettings.TRACES_INDEX.get(settings);
             components.add(new TraceGroupEnricher(
                 client,
                 threadPool,
