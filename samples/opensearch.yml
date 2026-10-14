@@ -5,8 +5,40 @@ discovery.type: single-node
 # Disable security for local testing
 plugins.security.disabled: true
 
-# gRPC transport — OpenSearch's built-in transport-grpc module receives OTLP on this port
-grpc.port: 4317
+# ── gRPC transport (plain, no TLS) ───────────────────────────────────────────
+#
+# Activates OpenSearch's built-in transport-grpc module and binds it to the
+# standard OTLP gRPC port.  Plain HTTP/2 is correct here because the Security
+# plugin is disabled; no TLS handshake is expected by the OTel Collector.
+#
+# For a production deployment with the Security plugin enabled, replace these
+# two lines with the secure variant:
+#
+#   aux.transport.types: secure-transport-grpc
+#   aux.transport.secure-transport-grpc.port: 4317
+#
+# secure-transport-grpc reads its TLS certificate and CA from the Security
+# plugin's existing keystore/truststore (plugins.security.ssl.*), so no extra
+# certificate configuration is needed beyond what Security already requires.
+# It enforces mTLS by default — every connecting client must present a
+# certificate signed by the configured CA.  To accept clients without a client
+# certificate (TLS server-auth only), add:
+#
+#   plugins.security.ssl.aux.transport.grpc.client_auth_mode: OPTIONAL
+#
+# The OTel Collector exporter must then be updated accordingly:
+#
+#   exporters:
+#     otlp/opensearch:
+#       endpoint: opensearch:4317
+#       tls:
+#         ca_file: /path/to/root-ca.pem        # always required
+#         cert_file: /path/to/client.pem        # required when mTLS is REQUIRE
+#         key_file:  /path/to/client-key.pem   # required when mTLS is REQUIRE
+#
+# ─────────────────────────────────────────────────────────────────────────────
+aux.transport.types: transport-grpc
+aux.transport.transport-grpc.port: 4317
 
 # OTLP plugin settings
 plugins.otlp.enabled: true
