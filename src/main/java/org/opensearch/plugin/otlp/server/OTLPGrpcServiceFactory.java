@@ -17,6 +17,7 @@ import org.opensearch.plugin.otlp.index.BulkIndexer;
 import org.opensearch.plugin.otlp.transform.LogsTransformer;
 import org.opensearch.plugin.otlp.transform.MetricsTransformer;
 import org.opensearch.plugin.otlp.transform.TraceTransformer;
+import org.opensearch.telemetry.metrics.MetricsRegistry;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.grpc.spi.GrpcServiceFactory;
 
@@ -25,8 +26,28 @@ import java.util.List;
 
 public class OTLPGrpcServiceFactory implements GrpcServiceFactory {
 
+    // OpenSearch discovers this class via ServiceLoader (META-INF/services), so the plugin
+    // cannot hold a direct reference to the instance.  Store it here so that
+    // OTLPPlugin.createComponents() can inject the MetricsRegistry after build() returns.
+    private static volatile OTLPGrpcServiceFactory INSTANCE;
+
     private Client client;
     private Settings settings;
+    private BulkIndexer bulkIndexer;
+
+    public OTLPGrpcServiceFactory() {
+        INSTANCE = this;
+    }
+
+    public static OTLPGrpcServiceFactory getInstance() {
+        return INSTANCE;
+    }
+
+    public void setMetricsRegistry(MetricsRegistry metricsRegistry) {
+        if (bulkIndexer != null) {
+            bulkIndexer.setMetricsRegistry(metricsRegistry);
+        }
+    }
 
     @Override
     public String plugin() {
@@ -51,9 +72,9 @@ public class OTLPGrpcServiceFactory implements GrpcServiceFactory {
             return List.of();
         }
         // MetricsRegistry is not available through the GrpcServiceFactory SPI —
-        // it is wired in Plugin.createComponents() which runs after build().
-        // BulkIndexer accepts a null MetricsRegistry and skips counter updates.
-        BulkIndexer bulkIndexer = new BulkIndexer(
+        // it arrives later via OTLPPlugin.createComponents().  OTLPPlugin calls
+        // OTLPGrpcServiceFactory.getInstance().setMetricsRegistry() at that point.
+        bulkIndexer = new BulkIndexer(
             client,
             OTLPPluginSettings.MAX_INFLIGHT_REQUESTS.get(settings),
             OTLPPluginSettings.REQUIRE_ALIAS.get(settings),

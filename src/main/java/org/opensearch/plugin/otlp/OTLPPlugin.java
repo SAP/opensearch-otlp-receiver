@@ -18,6 +18,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.plugin.otlp.server.OTLPGrpcServiceFactory;
 import org.opensearch.plugin.otlp.index.IndexTemplateManager;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricher;
@@ -62,6 +63,14 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
 
         if (!OTLPPluginSettings.ENABLED.get(settings)) {
             return List.of();
+        }
+
+        // Inject the MetricsRegistry into the BulkIndexer that OTLPGrpcServiceFactory
+        // created in build() — which runs before createComponents() and therefore
+        // cannot receive MetricsRegistry through the GrpcServiceFactory SPI.
+        OTLPGrpcServiceFactory grpcFactory = OTLPGrpcServiceFactory.getInstance();
+        if (grpcFactory != null) {
+            grpcFactory.setMetricsRegistry(metricsRegistry);
         }
 
         List<Object> components = new ArrayList<>();
