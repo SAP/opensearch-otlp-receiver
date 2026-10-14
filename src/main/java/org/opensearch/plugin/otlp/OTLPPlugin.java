@@ -10,6 +10,8 @@
  */
 package org.opensearch.plugin.otlp;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
@@ -32,17 +34,34 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Properties;
 import java.util.function.Supplier;
 
 public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
+
+    private static final Logger LOG = LogManager.getLogger(OTLPPlugin.class);
 
     private final Settings settings;
 
     public OTLPPlugin(Settings settings) {
         this.settings = settings;
+        LOG.info("OpenSearch OTLP Receiver plugin {} starting", readVersion());
+    }
+
+    private static String readVersion() {
+        try (InputStream in = OTLPPlugin.class.getResourceAsStream("/plugin-info.properties")) {
+            if (in != null) {
+                Properties props = new Properties();
+                props.load(in);
+                return props.getProperty("version", "unknown");
+            }
+        } catch (IOException ignored) {}
+        return "unknown";
     }
 
     @Override

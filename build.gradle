@@ -197,6 +197,12 @@ test {
     include '**/*Tests.class', '**/*IT.class'
 }
 
+processResources {
+    filesMatching('plugin-info.properties') {
+        expand(version: project.version)
+    }
+}
+
 // Print more details if any deprecated APIs are used
 tasks.withType(JavaCompile).configureEach {
     options.compilerArgs += ['-Xlint:deprecation']
