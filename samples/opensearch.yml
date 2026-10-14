@@ -17,14 +17,21 @@ plugins.security.disabled: true
 #   aux.transport.types: secure-transport-grpc
 #   aux.transport.secure-transport-grpc.port: 4317
 #
-# secure-transport-grpc reads its TLS certificate and CA from the Security
-# plugin's existing keystore/truststore (plugins.security.ssl.*), so no extra
-# certificate configuration is needed beyond what Security already requires.
+# secure-transport-grpc requires dedicated TLS certificate settings under the
+# plugins.security.ssl.aux.secure-transport-grpc.* namespace (separate from the
+# HTTP and inter-node transport certificates).  Files are resolved relative to
+# the OpenSearch config directory (e.g. $OPENSEARCH_HOME/config/):
+#
+#   plugins.security.ssl.aux.secure-transport-grpc.enabled:                true
+#   plugins.security.ssl.aux.secure-transport-grpc.pemcert_filepath:       certs/node.pem
+#   plugins.security.ssl.aux.secure-transport-grpc.pemkey_filepath:        certs/node-key.pem
+#   plugins.security.ssl.aux.secure-transport-grpc.pemtrustedcas_filepath: certs/root-ca.pem
+#
 # It enforces mTLS by default — every connecting client must present a
 # certificate signed by the configured CA.  To accept clients without a client
 # certificate (TLS server-auth only), add:
 #
-#   plugins.security.ssl.aux.transport.grpc.client_auth_mode: OPTIONAL
+#   plugins.security.ssl.aux.secure-transport-grpc.clientauth_mode: OPTIONAL
 #
 # The OTel Collector exporter must then be updated accordingly:
 #
@@ -33,8 +40,8 @@ plugins.security.disabled: true
 #       endpoint: opensearch:4317
 #       tls:
 #         ca_file: /path/to/root-ca.pem        # always required
-#         cert_file: /path/to/client.pem        # required when mTLS is REQUIRE
-#         key_file:  /path/to/client-key.pem   # required when mTLS is REQUIRE
+#         cert_file: /path/to/client.pem        # required when clientauth_mode: REQUIRE
+#         key_file:  /path/to/client-key.pem   # required when clientauth_mode: REQUIRE
 #
 # ─────────────────────────────────────────────────────────────────────────────
 aux.transport.types: transport-grpc
