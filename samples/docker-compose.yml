@@ -43,6 +43,8 @@ services:
     image: otel/opentelemetry-collector-contrib:0.123.0
     volumes:
       - ./otelcol-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4318:4318"   # OTLP HTTP — send-*.sh scripts post here; collector forwards to OpenSearch via gRPC
     depends_on:
       opensearch:
         condition: service_healthy
