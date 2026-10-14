@@ -12,13 +12,12 @@ Today, ingesting OTLP data into OpenSearch requires running Data Prepper as a se
 
 **Features:**
 
-- **gRPC endpoint** (port 4317) — standard OTLP/gRPC for all three signals
-- **HTTP endpoint** (port 4318) — OTLP/HTTP with protobuf and JSON content types
+- **gRPC endpoint** (port 4317) — standard OTLP/gRPC for all three signals, served by OpenSearch's built-in `transport-grpc` module
 - **All OTLP signals** — traces, metrics, and logs
 - **SS4O-compatible** — documents are indexed using the [Simple Schema for Observability](https://github.com/opensearch-project/opensearch-catalog/tree/main/docs/schema/observability) format, compatible with OpenSearch Dashboards Observability
 - **Auto-provisioned index templates** — SS4O index templates are created on plugin startup
 
-The plugin runs its own embedded gRPC and HTTP servers on dedicated ports (separate from OpenSearch's REST API). Incoming OTLP data is transformed into SS4O-compatible documents and bulk-indexed into OpenSearch:
+The plugin registers its gRPC services with OpenSearch's `transport-grpc` module via the `GrpcServiceFactory` SPI. Incoming OTLP data is transformed into SS4O-compatible documents and bulk-indexed into OpenSearch:
 
 - Traces to `otel-v1-apm-span-*`
 - Logs to `logs-otel-v1-*`
@@ -26,7 +25,7 @@ The plugin runs its own embedded gRPC and HTTP servers on dedicated ports (separ
 
 ## Requirements
 
-- **[OpenSearch](https://opensearch.org/downloads.html) 3.6.0** — the plugin is built against and tested with this version
+- **[OpenSearch](https://opensearch.org/downloads.html) 3.9.0** — the plugin is built against and tested with this version; the `transport-grpc` module (bundled with OpenSearch 3.9.0) must be enabled
 - **Java 21** — required to build the plugin from source
 - **[Docker](https://www.docker.com/) and Docker Compose** — required to run the sample setup and load tests
 - **[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) or any OTLP-compatible SDK** — to send telemetry data to the plugin
@@ -62,32 +61,56 @@ This starts OpenSearch (with the plugin installed), OpenSearch Dashboards, and a
 
 ## Configuration
 
-Enable the plugin by adding the following to `opensearch.yml`:
+The plugin uses OpenSearch's built-in `transport-grpc` module for its gRPC endpoint. Enable both in `opensearch.yml`:
 
 ```yaml
+# Enable the OTLP receiver plugin
 plugins.otlp.enabled: true
-plugins.otlp.port: 4317          # gRPC port
-plugins.otlp.http.port: 4318     # HTTP port
-plugins.otlp.bind_host: 0.0.0.0
+
+# Enable transport-grpc and set the gRPC port
+aux.transport.types: transport-grpc
+aux.transport.transport-grpc.port: 4317
 ```
 
-All available settings:
+All available plugin settings:
 
 | Setting | Default | Description |
 |---|---|---|
 | `plugins.otlp.enabled` | `false` | Enable the plugin |
-| `plugins.otlp.bind_host` | `0.0.0.0` | Host to bind the OTLP servers to |
-| `plugins.otlp.grpc.port` | `4317` | gRPC server port |
-| `plugins.otlp.http.port` | `4318` | HTTP server port |
 | `plugins.otlp.index.traces` | `otel-v1-apm-span` | Write alias/index for traces |
 | `plugins.otlp.index.metrics` | `metrics-otel-v1` | Write alias/index for metrics |
 | `plugins.otlp.index.logs` | `logs-otel-v1` | Write alias/index for logs |
 | `plugins.otlp.index.require_alias` | `false` | Reject writes to bare indices (enforce alias routing) |
-| `plugins.otlp.max_inflight_requests` | `64` | Maximum concurrent bulk index requests; excess returns HTTP 429 / gRPC RESOURCE_EXHAUSTED |
-| `plugins.otlp.max_request_bytes` | `4194304` | Maximum request body size in bytes (default 4 MiB) |
-| `plugins.otlp.compression.enabled` | `true` | Accept gzip-compressed requests |
+| `plugins.otlp.max_inflight_requests` | `64` | Maximum concurrent bulk index requests; excess returns gRPC RESOURCE_EXHAUSTED |
 
-Point your OpenTelemetry Collector or SDK at the plugin's ports:
+The gRPC port, bind address, and TLS settings are controlled by OpenSearch's `transport-grpc` module, not by the plugin itself. See the [transport-grpc documentation](https://opensearch.org/docs/latest/install-and-configure/configuring-opensearch/network-settings/) for the full list of options.
+
+### TLS / mTLS
+
+The plugin inherits TLS from whichever transport-grpc variant is active:
+
+| Mode | `aux.transport.types` value | TLS |
+|---|---|---|
+| Plain (dev/internal networks) | `transport-grpc` | No TLS |
+| TLS with optional client auth | `secure-transport-grpc` | Server TLS; client cert optional |
+| Mutual TLS (mTLS) | `secure-transport-grpc` | Client cert required (default) |
+
+For `secure-transport-grpc`, certificates are configured under the `plugins.security.ssl.aux.secure-transport-grpc.*` namespace (separate from HTTP and inter-node transport). Files are resolved relative to the OpenSearch config directory:
+
+```yaml
+plugins.security.ssl.aux.secure-transport-grpc.enabled:                true
+plugins.security.ssl.aux.secure-transport-grpc.pemcert_filepath:       certs/node.pem
+plugins.security.ssl.aux.secure-transport-grpc.pemkey_filepath:        certs/node-key.pem
+plugins.security.ssl.aux.secure-transport-grpc.pemtrustedcas_filepath: certs/root-ca.pem
+```
+
+Client authentication can be relaxed from the default `REQUIRE` to `OPTIONAL` with:
+
+```yaml
+plugins.security.ssl.aux.secure-transport-grpc.clientauth_mode: OPTIONAL
+```
+
+Point your OpenTelemetry Collector or SDK at the gRPC port:
 
 ```yaml
 # otel-collector-config.yaml
@@ -95,9 +118,7 @@ exporters:
   otlp:
     endpoint: "opensearch-host:4317"
     tls:
-      insecure: true
-  otlphttp:
-    endpoint: "http://opensearch-host:4318"
+      insecure: true   # dev only — omit or configure cert_file/key_file for TLS
 ```
 
 ### Plugin Metrics
@@ -126,8 +147,7 @@ telemetry.otel.metrics.exporter.class: io.opentelemetry.exporter.otlp.metrics.Ot
 ## Limitations
 
 - This project is a proof of concept and is not production-ready.
-- Security (TLS, authentication) is not yet implemented for the OTLP endpoints.
-- Only tested with OpenSearch 3.6.0.
+- Only tested with OpenSearch 3.9.0.
 
 ## Support, Feedback, Contributing
 
