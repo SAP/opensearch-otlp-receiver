@@ -27,6 +27,7 @@ import org.opensearch.transport.client.Client;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BulkIndexer {
 
@@ -35,6 +36,7 @@ public class BulkIndexer {
     private final Client client;
     private final Semaphore inflightSemaphore;
     private final boolean requireAlias;
+    private final AtomicBoolean metricsInitialized = new AtomicBoolean(false);
     private volatile Counter rejectedRequestsCounter;
     private volatile Counter inflightRequestsCounter;
 
@@ -47,6 +49,7 @@ public class BulkIndexer {
         this.inflightSemaphore = new Semaphore(maxInflight);
         this.requireAlias = requireAlias;
         if (metricsRegistry != null) {
+            metricsInitialized.set(true);
             this.rejectedRequestsCounter = metricsRegistry.createCounter(
                 "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
             this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(
@@ -55,7 +58,7 @@ public class BulkIndexer {
     }
 
     public void setMetricsRegistry(MetricsRegistry metricsRegistry) {
-        if (metricsRegistry != null && rejectedRequestsCounter == null) {
+        if (metricsRegistry != null && metricsInitialized.compareAndSet(false, true)) {
             this.rejectedRequestsCounter = metricsRegistry.createCounter(
                 "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
             this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(

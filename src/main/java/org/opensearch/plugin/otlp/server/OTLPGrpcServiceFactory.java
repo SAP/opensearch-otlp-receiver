@@ -23,6 +23,7 @@ import org.opensearch.transport.grpc.spi.GrpcServiceFactory;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class OTLPGrpcServiceFactory implements GrpcServiceFactory {
 
@@ -34,6 +35,7 @@ public class OTLPGrpcServiceFactory implements GrpcServiceFactory {
     private Client client;
     private Settings settings;
     private BulkIndexer bulkIndexer;
+    private final AtomicBoolean built = new AtomicBoolean(false);
 
     public OTLPGrpcServiceFactory() {
         INSTANCE = this;
@@ -70,6 +72,9 @@ public class OTLPGrpcServiceFactory implements GrpcServiceFactory {
     public List<BindableService> build() {
         if (!OTLPPluginSettings.ENABLED.get(settings)) {
             return List.of();
+        }
+        if (!built.compareAndSet(false, true)) {
+            throw new IllegalStateException("OTLPGrpcServiceFactory.build() called more than once");
         }
         // MetricsRegistry is not available through the GrpcServiceFactory SPI —
         // it arrives later via OTLPPlugin.createComponents().  OTLPPlugin calls
