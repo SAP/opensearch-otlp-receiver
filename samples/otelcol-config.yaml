@@ -17,11 +17,19 @@ processors:
       hostname_sources: [os]
 
 exporters:
-  # Forward to the OpenSearch OTLP plugin via gRPC
+  # Forward to the OpenSearch OTLP plugin via gRPC.
+  # tls.insecure skips certificate verification — correct for the dev setup
+  # where OpenSearch runs plain transport-grpc (no TLS).  For a production
+  # deployment using secure-transport-grpc, replace with:
+  #
+  #   tls:
+  #     ca_file: /path/to/root-ca.pem       # verifies the server certificate
+  #     cert_file: /path/to/client.pem      # client cert for mTLS (REQUIRE mode)
+  #     key_file:  /path/to/client-key.pem  # client key  for mTLS (REQUIRE mode)
   otlp/opensearch:
     endpoint: opensearch:4317
     tls:
-      insecure: true
+      insecure: true  # dev only — plain HTTP/2, no TLS
 
   debug:
     verbosity: basic

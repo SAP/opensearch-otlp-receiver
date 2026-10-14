@@ -10,8 +10,6 @@
  */
 package org.opensearch.plugin.otlp.index;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction;
@@ -21,7 +19,14 @@ import org.opensearch.cluster.metadata.ComposableIndexTemplate;
 import org.opensearch.cluster.metadata.Template;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.compress.CompressedXContent;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.DeprecationHandler;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
@@ -29,11 +34,11 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 
 public class IndexTemplateManager implements ClusterStateListener {
 
     private static final Logger logger = LogManager.getLogger(IndexTemplateManager.class);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final List<TemplateSpec> TEMPLATES = List.of(
         new TemplateSpec("ss4o_traces",      "otel-v1-apm-span*",
@@ -76,12 +81,25 @@ public class IndexTemplateManager implements ClusterStateListener {
         }
         try {
             String json = loadResource(spec.resourcePath);
-            JsonNode root = MAPPER.readTree(json);
-            JsonNode mappingsNode = root.path("template").path("mappings");
-            String mappingsJson = MAPPER.writeValueAsString(mappingsNode);
+            Map<String, Object> mappings;
+            try (XContentParser parser = XContentType.JSON.xContent().createParser(
+                    NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                    json.getBytes(StandardCharsets.UTF_8))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> root = parser.map();
+                @SuppressWarnings("unchecked")
+                Map<String, Object> m = (Map<String, Object>)
+                    ((Map<?, ?>) root.get("template")).get("mappings");
+                mappings = m;
+            }
+            CompressedXContent compressedMappings;
+            try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+                builder.map(mappings);
+                compressedMappings = new CompressedXContent(BytesReference.bytes(builder));
+            }
             ComposableIndexTemplate indexTemplate = new ComposableIndexTemplate(
                 List.of(spec.indexPattern),
-                new Template(null, new CompressedXContent(mappingsJson), null),
+                new Template(null, compressedMappings, null),
                 null, null, null, null
             );
             PutComposableIndexTemplateAction.Request request =

@@ -12,6 +12,7 @@ buildscript {
 
     dependencies {
         classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+        classpath 'com.google.protobuf:protobuf-gradle-plugin:0.9.4'
     }
 }
 
@@ -19,6 +20,7 @@ apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.pluginzip'
 apply plugin: 'opensearch.java-agent'
+apply plugin: 'com.google.protobuf'
 publishing {
     publications {
         pluginZip(MavenPublication) { publication ->
@@ -48,6 +50,33 @@ opensearchplugin {
     classname pluginClassname
     licenseFile rootProject.file('LICENSE')
     noticeFile rootProject.file('NOTICE.txt')
+    extendedPlugins = ['transport-grpc']
+}
+
+protobuf {
+    protoc {
+        artifact = 'com.google.protobuf:protoc:3.25.8'
+    }
+    plugins {
+        grpc {
+            artifact = 'io.grpc:protoc-gen-grpc-java:1.75.0'
+        }
+    }
+    generateProtoTasks {
+        all()*.plugins {
+            grpc {}
+        }
+    }
+}
+
+// The opentelemetry-proto JAR bundles google/protobuf well-known types alongside the OTel
+// proto definitions.  Re-generating them would produce com.google.protobuf.* classes that
+// duplicate OpenSearch's lib/protobuf-java and fail the jar hell checker.  Delete them after
+// extraction so protoc only compiles the opentelemetry.proto.* packages.
+tasks.matching { it.name == 'extractProto' }.configureEach {
+    doLast {
+        delete layout.buildDirectory.dir("extracted-protos/main/google")
+    }
 }
 
 // Disable checks not relevant for this plugin
@@ -65,59 +94,39 @@ repositories {
     maven { url "https://plugins.gradle.org/m2/" }
 }
 
-// ── Protobuf shading ──────────────────────────────────────────────────────────
+// ── Shading ───────────────────────────────────────────────────────────────────
 //
-// OpenSearch ships protobuf-java 3.x in lib/. The OTel proto classes require
-// protobuf 4.x. The jar hell checker (runs before the plugin classloader is set
-// up) rejects any jar whose classes duplicate names already in lib/.
-//
-// Partial shading (absorbing only the proto jars) fails because Armeria's gRPC
-// layer passes com.google.protobuf.Message objects across the boundary between
-// shaded and unshaded jars, causing NoSuchMethodError at runtime.
-//
-// Solution: build a shaded jar that absorbs the plugin's own classes plus all
-// runtime deps the plugin must bundle (runtimeClasspath minus resolveableCompileOnly,
-// which mirrors exactly what bundlePlugin uses for loose-jar bundling), then
-// relocates com.google.protobuf so there is no name clash with lib/protobuf-java-3.x.
+// The plugin uses OpenSearch's bundled protobuf-java (3.x in lib/) and must NOT
+// bundle it again — that would fail the jar hell checker.  gRPC and Netty are
+// provided by the transport-grpc module at runtime (via extendedPlugins).
+// Only a handful of proto utility deps remain in the fat jar.
 //
 // The Shadow plugin is NOT applied at the project level to avoid a compatibility
 // issue with opensearch.publish (which calls getByName("shadow") inside a
 // withPlugin callback before Shadow 9.x registers its component lazily).
 // Instead, a ShadowJar task is registered directly using the task type from the
 // shadow-gradle-plugin jar that build-tools already bundles.
-//
-// resolutionStrategy.force pins protobuf-java to 4.34.0 so Gradle resolves a
-// single version at compile time and does not raise a conflict error.
 // ─────────────────────────────────────────────────────────────────────────────
 
 configurations.all {
-    resolutionStrategy.force 'com.google.protobuf:protobuf-java:4.34.0'
-    resolutionStrategy.force 'com.google.protobuf:protobuf-java-util:4.34.0'
+    resolutionStrategy.force 'com.google.protobuf:protobuf-java:3.25.8'
+    resolutionStrategy.force 'com.google.guava:guava:33.4.0-jre'
+    resolutionStrategy.force 'com.google.api.grpc:proto-google-common-protos:2.63.2'
+    resolutionStrategy.force 'com.google.errorprone:error_prone_annotations:2.36.0'
 }
 
 tasks.register('shadedJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
     archiveClassifier = 'all'
-    relocate 'com.google.protobuf', 'org.opensearch.plugin.otlp.shaded.com.google.protobuf'
-    // Relocate micrometer so that ContextRegistry (which uses ServiceLoader to find
-    // ContextAccessor implementations) looks for the relocated interface name rather than
-    // io.micrometer.context.ContextAccessor.  reactor-core in lib/ registers
-    // ReactorContextAccessor under the original name, which the plugin classloader cannot
-    // load (reactor-core is in lib/ but context-propagation is only in the fat jar).
-    // After relocation the service file in lib/reactor-core is ignored because it
-    // registers an implementation of the original (now absent) interface.
-    relocate 'io.micrometer', 'org.opensearch.plugin.otlp.shaded.io.micrometer'
 
     // Absorb only jars the plugin must provide itself.  resolveableCompileOnly is
-    // the set of "provided" artifacts computed by opensearch.opensearchplugin.
-    // We subtract it from runtimeClasspath, but keep com.google.protobuf jars —
-    // OpenSearch ships protobuf-java 3.x; we must bundle 4.x with relocation so
-    // the jar hell checker sees only the relocated (private) package name.
+    // the set of "provided" artifacts computed by opensearch.opensearchplugin; it
+    // includes protobuf-java (from OpenSearch lib/) and gRPC/Netty (from transport-grpc),
+    // so those jars are excluded here.
     configurations = []
     with jar
     from({
         def provided = project.configurations.resolveableCompileOnly
             .resolvedConfiguration.resolvedArtifacts
-            .findAll { it.moduleVersion.id.module.group != 'com.google.protobuf' }
             .collect { it.file } as Set
         project.configurations.runtimeClasspath
             .findAll { !(it in provided) }
@@ -150,107 +159,48 @@ tasks.named('bundlePlugin').configure {
 }
 
 dependencies {
-    // OpenTelemetry protobuf definitions (requires protobuf 4.x runtime; see comment above)
-    implementation 'io.opentelemetry.proto:opentelemetry-proto:1.10.0-alpha'
+    // OTLP proto sources are extracted from the opentelemetry-proto artifact by the
+    // com.google.protobuf plugin and compiled by protoc 3.25.8.  The extractProto hook
+    // above removes the bundled google/protobuf well-known types before code generation.
+    // protobuf-java is NOT bundled — OpenSearch ships it in lib/ (3.25.8).
+    protobuf 'io.opentelemetry.proto:opentelemetry-proto:1.10.0-alpha'
 
-    implementation 'com.google.protobuf:protobuf-java:4.34.0'
-    implementation 'com.google.protobuf:protobuf-java-util:4.34.0'
+    // gRPC and transport-grpc SPI are provided by the transport-grpc module at runtime
+    // (declared in extendedPlugins above); we only need them on the compile classpath.
+    compileOnly "org.opensearch.plugin:transport-grpc-spi:${opensearch_version}"
+    compileOnly 'io.grpc:grpc-api:1.75.0'
+    compileOnly 'io.grpc:grpc-stub:1.75.0'
+    compileOnly 'io.grpc:grpc-protobuf:1.75.0'
+    // protoc-gen-grpc-java generates FutureStub code that references ListenableFuture.
+    // Guava is not bundled — it is provided at runtime by the transport-grpc module.
+    compileOnly 'com.google.guava:guava:33.4.0-jre'
 
-    // Armeria: unified gRPC + HTTP server (Netty 4.2.12.Final matches OpenSearch 3.6.0)
-    // OpenSearch build tools disable transitive resolution for non-opensearch deps,
-    // so every transitive dependency must be listed explicitly below.
-    implementation 'com.linecorp.armeria:armeria:1.38.0'
-    implementation 'com.linecorp.armeria:armeria-grpc:1.38.0'
-    implementation 'com.linecorp.armeria:armeria-grpc-protocol:1.38.0'
-    implementation 'com.linecorp.armeria:armeria-protobuf:1.38.0'
-
-    // gRPC (OpenSearch ships 1.75.0 only in the transport-grpc module, which is not
-    // accessible to plugins; bundle 1.80.0 to match Armeria's dependency)
-    implementation 'io.grpc:grpc-api:1.80.0'
-    implementation 'io.grpc:grpc-stub:1.80.0'
-    implementation 'io.grpc:grpc-core:1.80.0'
-    implementation 'io.grpc:grpc-context:1.80.0'
-    implementation 'io.grpc:grpc-protobuf:1.80.0'
-    implementation 'io.grpc:grpc-protobuf-lite:1.80.0'
-    implementation 'io.grpc:grpc-util:1.80.0'
-    implementation 'io.grpc:grpc-services:1.80.0'
-    implementation 'io.perfmark:perfmark-api:0.27.0'
-
-    // Netty extras not in OpenSearch lib/ (transport-netty4 is a module, not on plugin classpath)
-    implementation 'io.netty:netty-buffer:4.2.12.Final'
-    implementation 'io.netty:netty-codec-base:4.2.12.Final'
-    implementation 'io.netty:netty-codec-compression:4.2.12.Final'
-    implementation 'io.netty:netty-codec-dns:4.2.12.Final'
-    implementation 'io.netty:netty-codec-haproxy:4.2.12.Final'
-    implementation 'io.netty:netty-codec-http:4.2.12.Final'
-    implementation 'io.netty:netty-codec-http2:4.2.12.Final'
-    implementation 'io.netty:netty-codec-socks:4.2.12.Final'
-    implementation 'io.netty:netty-common:4.2.12.Final'
-    implementation 'io.netty:netty-handler:4.2.12.Final'
-    implementation 'io.netty:netty-handler-proxy:4.2.12.Final'
-    implementation 'io.netty:netty-resolver:4.2.12.Final'
-    implementation 'io.netty:netty-resolver-dns:4.2.12.Final'
-    implementation 'io.netty:netty-resolver-dns-classes-macos:4.2.12.Final'
-    implementation 'io.netty:netty-transport:4.2.12.Final'
-    implementation 'io.netty:netty-transport-classes-epoll:4.2.12.Final'
-    implementation 'io.netty:netty-transport-classes-kqueue:4.2.12.Final'
-    implementation 'io.netty:netty-transport-native-unix-common:4.2.12.Final'
-
-    // SLF4J API (required by Armeria; OpenSearch uses Log4j2 but does not ship slf4j)
-    implementation 'org.slf4j:slf4j-api:2.0.17'
-
-    // Jackson extras (jackson-core is in OpenSearch lib; databind and type modules are not)
-    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.21'
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.21.2'
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.21.2'
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.2'
-
-    // Micrometer (pulled in by Armeria for metrics; none shipped by OpenSearch)
-    implementation 'io.micrometer:micrometer-core:1.16.4'
-    implementation 'io.micrometer:micrometer-commons:1.16.4'
-    implementation 'io.micrometer:micrometer-observation:1.16.4'
-    implementation 'io.micrometer:context-propagation:1.2.1'
-
-    // Guava and related (used by gRPC core)
-    implementation 'com.google.guava:guava:33.5.0-jre'
-    implementation 'com.google.guava:failureaccess:1.0.3'
-
-    // Misc gRPC/Armeria transitive deps
+    // proto-google-common-protos provides com.google.rpc.RetryInfo used by
+    // RetryInfoCalculator. Not shipped by OpenSearch; must be bundled.
     implementation 'com.google.api.grpc:proto-google-common-protos:2.63.2'
-    implementation 'org.curioswitch.curiostack:protobuf-jackson:2.8.1'
-    implementation 'com.google.code.gson:gson:2.12.1'
-    implementation 'org.hdrhistogram:HdrHistogram:2.2.2'
-    implementation 'org.latencyutils:LatencyUtils:2.0.3'
-    implementation 'com.aayushatharva.brotli4j:brotli4j:1.22.0'
-    // reactor-core and reactive-streams are in OpenSearch lib/, no need to bundle
-    compileOnly 'io.projectreactor:reactor-core:3.8.4'
 
-    // OTel SDK exporters — used only in integration tests to send real OTLP signals.
-    // OpenSearch build tools disable transitive resolution for non-opensearch deps,
-    // so all transitive deps must be listed explicitly.
-    testImplementation 'io.opentelemetry:opentelemetry-api:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-context:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk-common:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk-trace:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk-metrics:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk-logs:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-sdk-extension-autoconfigure-spi:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-exporter-otlp:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-exporter-otlp-common:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-exporter-common:1.47.0'
-    testImplementation 'io.opentelemetry:opentelemetry-exporter-sender-okhttp:1.47.0'
-    // gRPC sender for the grpc protocol variant (not a transitive dep of exporter-otlp)
-    testImplementation 'io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel:1.47.0'
-    testImplementation 'io.grpc:grpc-netty:1.80.0'
-    // OkHttp (used by the HTTP exporters)
-    testImplementation 'com.squareup.okhttp3:okhttp:4.12.0'
-    testImplementation 'com.squareup.okio:okio-jvm:3.6.0'
-    testImplementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.10'
+    // IT tests call service.export() directly — no gRPC network connection needed.
+    // grpc-api/stub/protobuf are compileOnly (visible at test compile via compileClasspath)
+    // but must also be on the test runtime classpath.
+    testRuntimeOnly 'io.grpc:grpc-api:1.75.0'
+    testRuntimeOnly 'io.grpc:grpc-stub:1.75.0'
+    testRuntimeOnly 'io.grpc:grpc-protobuf:1.75.0'
+    testRuntimeOnly 'com.google.guava:guava:33.4.0-jre'
+
+    // Unit tests (document/transform) serialize to XContent JSON and parse back with Jackson 2.x.
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.22.2'
+    testImplementation 'com.fasterxml.jackson.core:jackson-core:2.22.2'
+    testImplementation 'com.fasterxml.jackson.core:jackson-annotations:2.22'
 }
 
 test {
     include '**/*Tests.class', '**/*IT.class'
+}
+
+processResources {
+    filesMatching('plugin-info.properties') {
+        expand(version: project.version)
+    }
 }
 
 // Print more details if any deprecated APIs are used

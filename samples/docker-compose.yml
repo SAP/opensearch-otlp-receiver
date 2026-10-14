@@ -1,7 +1,7 @@
 services:
 
   opensearch:
-    image: opensearchproject/opensearch:3.6.0
+    image: opensearchproject/opensearch:3.9.0
     environment:
       - discovery.type=single-node
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_1234!
@@ -12,11 +12,10 @@ services:
         hard: -1
     ports:
       - "9200:9200"
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
+      - "4317:4317"   # OTLP gRPC (transport-grpc)
     volumes:
       - ./opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
-      - ../build/distributions/opensearch-otlp-receiver-0.1.0.zip:/tmp/opensearch-otlp-receiver.zip:ro
+      - ../build/distributions/opensearch-otlp-receiver-0.2.1.zip:/tmp/opensearch-otlp-receiver.zip:ro
     command: >
       bash -c "
         opensearch-plugin remove opensearch-otlp-receiver --purge 2>/dev/null || true &&
@@ -30,7 +29,7 @@ services:
       retries: 12
 
   dashboards:
-    image: opensearchproject/opensearch-dashboards:3.6.0
+    image: opensearchproject/opensearch-dashboards:3.9.0
     environment:
       - OPENSEARCH_HOSTS=http://opensearch:9200
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
@@ -44,6 +43,8 @@ services:
     image: otel/opentelemetry-collector-contrib:0.123.0
     volumes:
       - ./otelcol-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4318:4318"   # OTLP HTTP — send-*.sh scripts post here; collector forwards to OpenSearch via gRPC
     depends_on:
       opensearch:
         condition: service_healthy
