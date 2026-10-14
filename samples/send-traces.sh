@@ -10,9 +10,9 @@ ENDPOINT="${1:-http://localhost:4318}"
 NOW_NS=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time() * 1e9))")
 END_NS=$((NOW_NS + 5000000))   # +5 ms
 
-TRACE_ID="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | base64 | tr -d '=\n')"
-ROOT_SPAN_ID="$(dd if=/dev/urandom bs=8  count=1 2>/dev/null | base64 | tr -d '=\n')"
-CHILD_SPAN_ID="$(dd if=/dev/urandom bs=8  count=1 2>/dev/null | base64 | tr -d '=\n')"
+TRACE_ID="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+ROOT_SPAN_ID="$(od -An -tx1 -N8  /dev/urandom | tr -d ' \n')"
+CHILD_SPAN_ID="$(od -An -tx1 -N8  /dev/urandom | tr -d ' \n')"
 
 curl -sf -X POST "${ENDPOINT}/v1/traces" \
   -H "Content-Type: application/json" \
