@@ -35,8 +35,8 @@ public class BulkIndexer {
     private final Client client;
     private final Semaphore inflightSemaphore;
     private final boolean requireAlias;
-    private final Counter rejectedRequestsCounter;
-    private final Counter inflightRequestsCounter;
+    private volatile Counter rejectedRequestsCounter;
+    private volatile Counter inflightRequestsCounter;
 
     public BulkIndexer(
             Client client,
@@ -51,9 +51,15 @@ public class BulkIndexer {
                 "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
             this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(
                 "otlp.inflight_requests", "Current number of in-flight bulk index requests", "1");
-        } else {
-            this.rejectedRequestsCounter = null;
-            this.inflightRequestsCounter = null;
+        }
+    }
+
+    public void setMetricsRegistry(MetricsRegistry metricsRegistry) {
+        if (metricsRegistry != null && rejectedRequestsCounter == null) {
+            this.rejectedRequestsCounter = metricsRegistry.createCounter(
+                "otlp.rejected_requests", "Requests rejected due to max_inflight_requests limit", "1");
+            this.inflightRequestsCounter = metricsRegistry.createUpDownCounter(
+                "otlp.inflight_requests", "Current number of in-flight bulk index requests", "1");
         }
     }
 
