@@ -5,11 +5,50 @@ discovery.type: single-node
 # Disable security for local testing
 plugins.security.disabled: true
 
+# ── gRPC transport (plain, no TLS) ───────────────────────────────────────────
+#
+# Activates OpenSearch's built-in transport-grpc module and binds it to the
+# standard OTLP gRPC port.  Plain HTTP/2 is correct here because the Security
+# plugin is disabled; no TLS handshake is expected by the OTel Collector.
+#
+# For a production deployment with the Security plugin enabled, replace these
+# two lines with the secure variant:
+#
+#   aux.transport.types: secure-transport-grpc
+#   aux.transport.secure-transport-grpc.port: 4317
+#
+# secure-transport-grpc requires dedicated TLS certificate settings under the
+# plugins.security.ssl.aux.secure-transport-grpc.* namespace (separate from the
+# HTTP and inter-node transport certificates).  Files are resolved relative to
+# the OpenSearch config directory (e.g. $OPENSEARCH_HOME/config/):
+#
+#   plugins.security.ssl.aux.secure-transport-grpc.enabled:                true
+#   plugins.security.ssl.aux.secure-transport-grpc.pemcert_filepath:       certs/node.pem
+#   plugins.security.ssl.aux.secure-transport-grpc.pemkey_filepath:        certs/node-key.pem
+#   plugins.security.ssl.aux.secure-transport-grpc.pemtrustedcas_filepath: certs/root-ca.pem
+#
+# It enforces mTLS by default — every connecting client must present a
+# certificate signed by the configured CA.  To accept clients without a client
+# certificate (TLS server-auth only), add:
+#
+#   plugins.security.ssl.aux.secure-transport-grpc.clientauth_mode: OPTIONAL
+#
+# The OTel Collector exporter must then be updated accordingly:
+#
+#   exporters:
+#     otlp/opensearch:
+#       endpoint: opensearch:4317
+#       tls:
+#         ca_file: /path/to/root-ca.pem        # always required
+#         cert_file: /path/to/client.pem        # required when clientauth_mode: REQUIRE
+#         key_file:  /path/to/client-key.pem   # required when clientauth_mode: REQUIRE
+#
+# ─────────────────────────────────────────────────────────────────────────────
+aux.transport.types: transport-grpc
+aux.transport.transport-grpc.port: 4317
+
 # OTLP plugin settings
 plugins.otlp.enabled: true
-plugins.otlp.port: 4317
-plugins.otlp.http.port: 4318
-plugins.otlp.bind_host: "0.0.0.0"
 plugins.otlp.index.create_templates: true
 
 # Plugin logging
