@@ -47,8 +47,8 @@ public class IndexTemplateManager implements ClusterStateListener {
             "templates/logs-otel-v1-index-standard-template.json"),
         new TemplateSpec("ss4o_metrics",     "metrics-otel-v1*",
             "templates/metrics-otel-v1-index-standard-template.json"),
-        new TemplateSpec("ss4o_service_map", "otel-v1-apm-service-map*",
-            "templates/otel-v1-apm-service-map-index-standard-template.json")
+        new TemplateSpec("ss4o_service_map", "otel-v2-apm-service-map*",
+            "templates/otel-v2-apm-service-map-index-standard-template.json")
     );
 
     private final Client client;

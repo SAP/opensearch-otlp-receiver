@@ -15,161 +15,213 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.util.ArrayList;
-import java.util.Collections;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+@SuppressWarnings("unchecked")
 public class ServiceMapBuilderTests extends OpenSearchTestCase {
 
-    // ── cross-service edge emits 2 relationship docs ──────────────────────────
+    private static final Instant FIRST_TICK = Instant.parse("2026-10-16T12:00:00Z");
+    private static final Instant SECOND_TICK = Instant.parse("2026-10-16T12:01:00Z");
 
-    public void testCrossServiceEdgeEmitsTwoDocs() {
-        Map<String, Object> parentSpan = new HashMap<>();
-        parentSpan.put("spanId", "span-root");
-        parentSpan.put("serviceName", "frontend");
-        parentSpan.put("kind", "SPAN_KIND_CLIENT");
-        parentSpan.put("traceGroup", "checkout");
+    public void testCrossServiceClientServerPairEmitsEdgeAndLeaf() {
+        Map<String, Object> clientSpan = span(
+            "trace-1", "client", null, "frontend", "SPAN_KIND_CLIENT", "POST /checkout");
+        Map<String, Object> serverSpan = span(
+            "trace-1", "server", "client", "checkout", "SPAN_KIND_SERVER", "Checkout");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(clientSpan, serverSpan));
 
-        Map<String, Object> childSpan = new HashMap<>();
-        childSpan.put("traceId", "trace1");
-        childSpan.put("spanId", "span-child");
-        childSpan.put("parentSpanId", "span-root");
-        childSpan.put("serviceName", "backend");
-        childSpan.put("kind", "SPAN_KIND_SERVER");
-        childSpan.put("name", "process");
-        childSpan.put("traceGroup", "checkout");
+        builder(client, FIRST_TICK, List.of()).run();
 
-        // run() issues: child search → parent search
-        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
-            List.of(childSpan),   // child spans search
-            List.of(parentSpan)   // parent spans search
-        ));
-        ServiceMapBuilder builder = builder(client);
+        BulkRequest bulk = onlyBulk(client);
+        assertEquals("one edge and one leaf observation", 2, bulk.numberOfActions());
 
-        builder.run();
+        Map<String, Object> edge = documents(bulk).stream()
+            .filter(document -> document.get("targetNode") != null)
+            .findFirst().orElseThrow();
+        assertNode(edge, "sourceNode", "frontend", "generic:default");
+        assertNode(edge, "targetNode", "checkout", "generic:default");
+        assertEquals("POST /checkout", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
+        assertEquals("Checkout", ((Map<String, Object>) edge.get("targetOperation")).get("name"));
+        assertEquals(FIRST_TICK.toString(), edge.get("timestamp"));
+        assertNotNull(edge.get("nodeConnectionHash"));
+        assertNotNull(edge.get("operationConnectionHash"));
 
-        assertEquals("one bulk request for service map", 1, client.bulkRequests.size());
-        BulkRequest bulk = client.bulkRequests.get(0);
-        assertEquals("two IndexRequests for cross-service edge", 2, bulk.numberOfActions());
-
-        boolean hasDestination = bulk.requests().stream()
-            .filter(r -> r instanceof IndexRequest)
-            .map(r -> (IndexRequest) r)
-            .anyMatch(r -> {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> src = (Map<String, Object>) r.sourceAsMap();
-                return "frontend".equals(src.get("serviceName")) && src.containsKey("destination");
-            });
-        boolean hasTarget = bulk.requests().stream()
-            .filter(r -> r instanceof IndexRequest)
-            .map(r -> (IndexRequest) r)
-            .anyMatch(r -> {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> src = (Map<String, Object>) r.sourceAsMap();
-                return "backend".equals(src.get("serviceName")) && src.containsKey("target");
-            });
-        assertTrue("destination doc present", hasDestination);
-        assertTrue("target doc present", hasTarget);
+        Map<String, Object> leaf = documents(bulk).stream()
+            .filter(document -> document.get("targetNode") == null)
+            .findFirst().orElseThrow();
+        assertNode(leaf, "sourceNode", "checkout", "generic:default");
+        assertNull(leaf.get("targetOperation"));
     }
 
-    // ── same-service spans emit no relationship docs ──────────────────────────
+    public void testServerWithoutRootOrTraceGroupEmitsLeaf() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-orphan", "server", "missing", "worker", "SPAN_KIND_SERVER", "consume")));
 
-    public void testSameServiceEmitsNoDocs() {
-        Map<String, Object> parentSpan = new HashMap<>();
-        parentSpan.put("spanId", "span-root");
-        parentSpan.put("serviceName", "my-service");
-        parentSpan.put("kind", "SPAN_KIND_SERVER");
+        builder(client, FIRST_TICK, List.of()).run();
 
-        Map<String, Object> childSpan = new HashMap<>();
-        childSpan.put("traceId", "trace2");
-        childSpan.put("spanId", "span-child");
-        childSpan.put("parentSpanId", "span-root");
-        childSpan.put("serviceName", "my-service");
-        childSpan.put("kind", "SPAN_KIND_INTERNAL");
-        childSpan.put("name", "internal-op");
-
-        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
-            List.of(childSpan),   // child spans search
-            List.of(parentSpan)   // parent spans search
-        ));
-        ServiceMapBuilder builder = builder(client);
-
-        builder.run();
-
-        assertEquals("no bulk requests when same service", 0, client.bulkRequests.size());
+        Map<String, Object> leaf = documents(onlyBulk(client)).get(0);
+        assertNode(leaf, "sourceNode", "worker", "generic:default");
+        assertNull(leaf.get("targetNode"));
+        assertFalse("v2 documents do not contain trace groups", leaf.containsKey("traceGroupName"));
     }
 
-    // ── child whose parent is not found emits no doc ──────────────────────────
+    public void testSameServiceCallDoesNotEmitAnEdge() {
+        Map<String, Object> clientSpan = span(
+            "trace-same", "client", null, "orders", "SPAN_KIND_CLIENT", "internal call");
+        Map<String, Object> serverSpan = span(
+            "trace-same", "server", "client", "orders", "SPAN_KIND_SERVER", "internal handler");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(clientSpan, serverSpan));
 
-    public void testOrphanSpanEmitsNoDocs() {
-        Map<String, Object> childSpan = new HashMap<>();
-        childSpan.put("traceId", "trace3");
-        childSpan.put("spanId", "span-child");
-        childSpan.put("parentSpanId", "span-missing");
-        childSpan.put("serviceName", "svc-b");
-        childSpan.put("kind", "SPAN_KIND_SERVER");
-        childSpan.put("name", "op");
+        builder(client, FIRST_TICK, List.of()).run();
 
-        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
-            List.of(childSpan),        // child spans search
-            Collections.emptyList()    // parent spans search → parent not found
-        ));
-        ServiceMapBuilder builder = builder(client);
-
-        builder.run();
-
-        assertEquals("no bulk requests when parent not found", 0, client.bulkRequests.size());
+        List<Map<String, Object>> documents = documents(onlyBulk(client));
+        assertEquals(1, documents.size());
+        assertNull(documents.get(0).get("targetNode"));
     }
 
-    // ── child search pages through multiple searchAfter calls ─────────────────
-
-    public void testChildSearchPagesThroughMultipleBatches() {
-        // Build 10000 child spans (first page) then 1 more (second page)
-        List<Map<String, Object>> firstPage = new ArrayList<>();
-        for (int i = 0; i < 10000; i++) {
-            Map<String, Object> child = new HashMap<>();
-            child.put("traceId", "trace" + i);
-            child.put("spanId", "child-" + i);
-            child.put("parentSpanId", "parent-" + i);
-            child.put("serviceName", "svc-b");
-            child.put("kind", "SPAN_KIND_SERVER");
-            child.put("name", "op");
-            firstPage.add(child);
-        }
-        Map<String, Object> lastChild = new HashMap<>();
-        lastChild.put("traceId", "trace-last");
-        lastChild.put("spanId", "child-last");
-        lastChild.put("parentSpanId", "parent-last");
-        lastChild.put("serviceName", "svc-b");
-        lastChild.put("kind", "SPAN_KIND_SERVER");
-        lastChild.put("name", "op");
-
-        // Two child searches, then one parent search (empty — no edges produced)
+    public void testLateParentIsCorrelatedOnOverlappingLookback() {
+        Map<String, Object> clientSpan = span(
+            "trace-late", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /late");
+        Map<String, Object> serverSpan = span(
+            "trace-late", "server", "client", "backend", "SPAN_KIND_SERVER", "late handler");
         TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
-            firstPage,                  // first page of child search (10000 hits)
-            List.of(lastChild),         // second page of child search (1 hit)
-            Collections.emptyList()     // parent search → empty
-        ));
-        ServiceMapBuilder builder = builder(client);
+            List.of(serverSpan),
+            List.of(clientSpan, serverSpan)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK, List.of());
 
         builder.run();
+        builder.run();
 
-        assertEquals("three searches: 2 child pages + 1 parent", 3, client.searchRequests.size());
-        assertNotNull("second child search had searchAfter set",
-            client.searchRequests.get(1).source().searchAfter());
+        assertEquals(2, client.bulkRequests.size());
+        assertFalse(documents(client.bulkRequests.get(0)).stream()
+            .anyMatch(document -> document.get("targetNode") != null));
+        assertTrue(documents(client.bulkRequests.get(1)).stream()
+            .anyMatch(document -> document.get("targetNode") != null));
+        assertTrue("every tick uses the full overlap window",
+            client.searchRequests.stream().allMatch(request ->
+                request.source().query().toString().contains("now-300s")));
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    public void testHashesAreStableWhileTimestampedIdsPreserveHistory() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-history", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-history", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient firstClient = stub(spans);
+        TraceGroupEnricherTests.StubClient secondClient = stub(spans);
 
-    private static ServiceMapBuilder builder(TraceGroupEnricherTests.StubClient client) {
+        builder(firstClient, FIRST_TICK, List.of()).run();
+        builder(secondClient, SECOND_TICK, List.of()).run();
+
+        IndexRequest first = edgeRequest(onlyBulk(firstClient));
+        IndexRequest second = edgeRequest(onlyBulk(secondClient));
+        Map<String, Object> firstSource = first.sourceAsMap();
+        Map<String, Object> secondSource = second.sourceAsMap();
+        assertEquals(firstSource.get("nodeConnectionHash"), secondSource.get("nodeConnectionHash"));
+        assertEquals(firstSource.get("operationConnectionHash"), secondSource.get("operationConnectionHash"));
+        assertNotEquals("observation IDs include time and do not overwrite history", first.id(), second.id());
+        assertNotEquals(firstSource.get("timestamp"), secondSource.get("timestamp"));
+    }
+
+    public void testEnvironmentAndConfiguredGroupingAttributesAreEmitted() {
+        Map<String, Object> serverSpan = span(
+            "trace-env", "server", null, "payments", "SPAN_KIND_SERVER", "charge");
+        serverSpan.put("resource", Map.of("attributes", Map.of(
+            "deployment.environment.name", "production",
+            "service.version", "2.4.0",
+            "k8s.cluster.name", "eu-central")));
+        TraceGroupEnricherTests.StubClient client = stub(List.of(serverSpan));
+
+        builder(client, FIRST_TICK, List.of("service.version", "k8s.cluster.name")).run();
+
+        Map<String, Object> sourceNode = (Map<String, Object>)
+            documents(onlyBulk(client)).get(0).get("sourceNode");
+        Map<String, Object> keyAttributes = (Map<String, Object>) sourceNode.get("keyAttributes");
+        assertEquals("production", keyAttributes.get("environment"));
+        assertEquals(Map.of("service.version", "2.4.0", "k8s.cluster.name", "eu-central"),
+            sourceNode.get("groupByAttributes"));
+    }
+
+    public void testEntryServerOperationBecomesEdgeSourceOperation() {
+        Map<String, Object> entry = span(
+            "trace-entry", "entry", null, "frontend", "SPAN_KIND_SERVER", "POST /orders");
+        Map<String, Object> clientCall = span(
+            "trace-entry", "client", "entry", "frontend", "SPAN_KIND_CLIENT", "HTTP GET");
+        Map<String, Object> downstream = span(
+            "trace-entry", "downstream", "client", "inventory", "SPAN_KIND_SERVER", "Reserve");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(entry, clientCall, downstream));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        Map<String, Object> edge = edgeRequest(onlyBulk(client)).sourceAsMap();
+        assertEquals("POST /orders", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
+    }
+
+    private static TraceGroupEnricherTests.StubClient stub(List<Map<String, Object>> spans) {
+        return new TraceGroupEnricherTests.StubClient(List.of(spans));
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client, Instant time, List<String> groupByAttributes) {
         return new ServiceMapBuilder(
-            client, null,
+            client,
+            null,
             "otel-v1-apm-span",
-            "otel-v1-apm-service-map",
+            "otel-v2-apm-service-map",
             new TimeValue(60, TimeUnit.SECONDS),
-            new TimeValue(5, TimeUnit.MINUTES));
+            new TimeValue(5, TimeUnit.MINUTES),
+            groupByAttributes,
+            Clock.fixed(time, ZoneOffset.UTC));
+    }
+
+    private static Map<String, Object> span(
+            String traceId,
+            String spanId,
+            String parentSpanId,
+            String serviceName,
+            String kind,
+            String name) {
+        Map<String, Object> span = new HashMap<>();
+        span.put("traceId", traceId);
+        span.put("spanId", spanId);
+        if (parentSpanId != null) {
+            span.put("parentSpanId", parentSpanId);
+        }
+        span.put("serviceName", serviceName);
+        span.put("kind", kind);
+        span.put("name", name);
+        return span;
+    }
+
+    private static BulkRequest onlyBulk(TraceGroupEnricherTests.StubClient client) {
+        assertEquals("expected one bulk request", 1, client.bulkRequests.size());
+        return client.bulkRequests.get(0);
+    }
+
+    private static List<Map<String, Object>> documents(BulkRequest bulk) {
+        return bulk.requests().stream()
+            .map(request -> ((IndexRequest) request).sourceAsMap())
+            .toList();
+    }
+
+    private static IndexRequest edgeRequest(BulkRequest bulk) {
+        return bulk.requests().stream()
+            .map(request -> (IndexRequest) request)
+            .filter(request -> request.sourceAsMap().get("targetNode") != null)
+            .findFirst().orElseThrow();
+    }
+
+    private static void assertNode(
+            Map<String, Object> document, String field, String name, String environment) {
+        Map<String, Object> node = (Map<String, Object>) document.get(field);
+        assertEquals("service", node.get("type"));
+        Map<String, Object> keys = (Map<String, Object>) node.get("keyAttributes");
+        assertEquals(name, keys.get("name"));
+        assertEquals(environment, keys.get("environment"));
     }
 }

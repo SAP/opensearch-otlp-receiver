@@ -108,13 +108,18 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
                 OTLPPluginSettings.ENRICHMENT_LOOKBACK_WINDOW.get(settings),
                 OTLPPluginSettings.ENRICHMENT_TRACE_CUTOFF.get(settings),
                 OTLPPluginSettings.ENRICHMENT_BATCH_SIZE.get(settings)));
+        }
+
+        if (OTLPPluginSettings.SERVICE_MAP_ENABLED.get(settings)) {
+            String tracesIndex = OTLPPluginSettings.TRACES_INDEX.get(settings);
             components.add(new ServiceMapBuilder(
                 client,
                 threadPool,
                 tracesIndex,
                 OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
                 OTLPPluginSettings.SERVICE_MAP_INTERVAL.get(settings),
-                OTLPPluginSettings.ENRICHMENT_LOOKBACK_WINDOW.get(settings)));
+                OTLPPluginSettings.SERVICE_MAP_LOOKBACK_WINDOW.get(settings),
+                OTLPPluginSettings.SERVICE_MAP_GROUP_BY_ATTRIBUTES.get(settings)));
         }
 
         return components;

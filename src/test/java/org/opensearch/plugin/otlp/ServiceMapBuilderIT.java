@@ -12,6 +12,7 @@ package org.opensearch.plugin.otlp;
 
 import com.google.protobuf.ByteString;
 import io.opentelemetry.proto.trace.v1.Span;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
 import org.opensearch.search.SearchHit;
@@ -25,7 +26,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
-    private static final String SERVICE_MAP_INDEX = "otel-v1-apm-service-map-test";
+    private static final String SERVICE_MAP_INDEX = "otel-v2-apm-service-map-test";
 
     private static final ByteString TRACE_ID = ByteString.copyFrom(
         new byte[]{ 10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25 });
@@ -34,7 +35,7 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
     private static final ByteString CHILD_SPAN_ID = ByteString.copyFrom(
         new byte[]{ 20,21,22,23,24,25,26,27 });
 
-    // ── two-service trace produces two relationship docs ──────────────────────
+    // ── two-service trace produces one edge and one leaf observation ──────────
 
     public void testTwoServicesProduceTwoRelationships() throws Exception {
         // Root span from frontend-svc (CLIENT)
@@ -48,18 +49,52 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
         builder().run();
         refresh(SERVICE_MAP_INDEX);
+        assertV2Mapping();
 
-        assertEquals("two relationship documents in service map",
+        assertEquals("one edge and one leaf document in service map",
             2, searchAll(SERVICE_MAP_INDEX).getHits().getTotalHits().value());
 
-        boolean hasDestination = false, hasTarget = false;
+        boolean hasEdge = false, hasLeaf = false;
         for (SearchHit hit : searchAll(SERVICE_MAP_INDEX).getHits().getHits()) {
             Map<String, Object> src = hit.getSourceAsMap();
-            if (src.containsKey("destination")) hasDestination = true;
-            if (src.containsKey("target")) hasTarget = true;
+            assertNotNull("timestamp is required", src.get("timestamp"));
+            assertNotNull("node hash is required", src.get("nodeConnectionHash"));
+            assertNotNull("operation hash is required", src.get("operationConnectionHash"));
+            if (src.get("targetNode") == null) {
+                hasLeaf = true;
+            } else {
+                hasEdge = true;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> sourceNode = (Map<String, Object>) src.get("sourceNode");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> targetNode = (Map<String, Object>) src.get("targetNode");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> sourceKeys = (Map<String, Object>) sourceNode.get("keyAttributes");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> targetKeys = (Map<String, Object>) targetNode.get("keyAttributes");
+                assertEquals("frontend-svc", sourceKeys.get("name"));
+                assertEquals("backend-svc", targetKeys.get("name"));
+                assertEquals("generic:default", sourceKeys.get("environment"));
+            }
         }
-        assertTrue("destination relationship doc present", hasDestination);
-        assertTrue("target relationship doc present", hasTarget);
+        assertTrue("edge document present", hasEdge);
+        assertTrue("leaf document present", hasLeaf);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertV2Mapping() {
+        GetMappingsResponse response = client().admin().indices()
+            .prepareGetMappings(SERVICE_MAP_INDEX).get();
+        Map<String, Object> properties = (Map<String, Object>)
+            response.getMappings().get(SERVICE_MAP_INDEX).sourceAsMap().get("properties");
+
+        assertTrue(properties.containsKey("sourceNode"));
+        assertTrue(properties.containsKey("targetNode"));
+        assertTrue(properties.containsKey("sourceOperation"));
+        assertTrue(properties.containsKey("targetOperation"));
+        assertMappingType(properties, "nodeConnectionHash", "keyword");
+        assertMappingType(properties, "operationConnectionHash", "keyword");
+        assertMappingType(properties, "timestamp", "date");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

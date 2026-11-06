@@ -91,6 +91,8 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
             assertTrue("ss4o_traces template not yet installed",  templates.containsKey("ss4o_traces"));
             assertTrue("ss4o_logs template not yet installed",    templates.containsKey("ss4o_logs"));
             assertTrue("ss4o_metrics template not yet installed", templates.containsKey("ss4o_metrics"));
+            assertTrue("ss4o_service_map template not yet installed",
+                templates.containsKey("ss4o_service_map"));
         }, 30, TimeUnit.SECONDS);
     }
 
@@ -102,7 +104,7 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
 
     private void deleteTestIndices() {
         for (String index : new String[]{ TRACES_INDEX, LOGS_INDEX, METRICS_INDEX,
-                "otel-v1-apm-service-map-test" }) {
+                "otel-v2-apm-service-map-test" }) {
             try {
                 client().admin().indices().delete(new DeleteIndexRequest(index)).actionGet();
             } catch (Exception ignored) {}

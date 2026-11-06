@@ -22,6 +22,7 @@ The plugin registers its gRPC services with OpenSearch's `transport-grpc` module
 - Traces to `otel-v1-apm-span-*`
 - Logs to `logs-otel-v1-*`
 - Metrics to `metrics-otel-v1-*`
+- APM service-map v2 observations to `otel-v2-apm-service-map*`
 
 ## Requirements
 
@@ -41,6 +42,19 @@ cd opensearch-otlp-receiver
 ```
 
 The plugin zip is created at `build/distributions/opensearch-otlp-receiver-<version>.zip`.
+
+### End-to-end test
+
+With Docker and Docker Compose available, run the packaged plugin against a real
+OpenSearch node and ingest traces, metrics, and logs through an OpenTelemetry
+Collector:
+
+```bash
+./gradlew e2eTest
+```
+
+The end-to-end test is intentionally separate from `check`, so regular builds do
+not require Docker.
 
 ### Install into OpenSearch
 
@@ -82,6 +96,15 @@ All available plugin settings:
 | `plugins.otlp.index.logs` | `logs-otel-v1` | Write alias/index for logs |
 | `plugins.otlp.index.require_alias` | `false` | Reject writes to bare indices (enforce alias routing) |
 | `plugins.otlp.max_inflight_requests` | `64` | Maximum concurrent bulk index requests; excess returns gRPC RESOURCE_EXHAUSTED |
+| `plugins.otlp.service_map.enabled` | `true` | Generate APM v2 service-map observations from recent spans |
+| `plugins.otlp.service_map.index` | `otel-v2-apm-service-map` | Service-map write index |
+| `plugins.otlp.service_map.interval` | `60s` | Interval between service-map correlation runs |
+| `plugins.otlp.service_map.lookback_window` | `5m` | Overlapping span window used to correlate late and out-of-order spans |
+| `plugins.otlp.service_map.group_by_attributes` | `[]` | Resource attributes copied into each node's `groupByAttributes` |
+
+Service-map nodes derive their environment from OpenTelemetry cloud and deployment
+resource attributes and fall back to `generic:default`. The overlapping lookback
+window should be longer than the maximum expected span delivery delay.
 
 The gRPC port, bind address, and TLS settings are controlled by OpenSearch's `transport-grpc` module, not by the plugin itself. See the [transport-grpc documentation](https://opensearch.org/docs/latest/install-and-configure/configuring-opensearch/network-settings/) for the full list of options.
 
@@ -148,6 +171,9 @@ telemetry.otel.metrics.exporter.class: io.opentelemetry.exporter.otlp.metrics.Ot
 
 - This project is a proof of concept and is not production-ready.
 - Only tested with OpenSearch 3.9.0.
+- Service-map v2 currently covers instrumented service-to-service edges and leaf
+  services. Synthesized database, messaging, and external dependency nodes are
+  not yet generated.
 
 ## Support, Feedback, Contributing
 

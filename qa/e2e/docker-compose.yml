@@ -1,0 +1,39 @@
+services:
+  opensearch:
+    image: ${E2E_OPENSEARCH_IMAGE:?E2E_OPENSEARCH_IMAGE must be set}
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_1234!
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "127.0.0.1::9200"
+    volumes:
+      - ./opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ${E2E_PLUGIN_ZIP:?E2E_PLUGIN_ZIP must be set}:/tmp/opensearch-otlp-receiver.zip:ro
+    command: >
+      bash -c "
+        opensearch-plugin remove opensearch-otlp-receiver --purge 2>/dev/null || true &&
+        opensearch-plugin install --batch file:///tmp/opensearch-otlp-receiver.zip &&
+        /usr/share/opensearch/bin/opensearch
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9200/_cluster/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    volumes:
+      - ./otelcol-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1::4318"
+      - "127.0.0.1::13133"
+    depends_on:
+      opensearch:
+        condition: service_healthy
