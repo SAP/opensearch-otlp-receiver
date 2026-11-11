@@ -13,11 +13,16 @@ package org.opensearch.plugin.otlp;
 import com.google.protobuf.ByteString;
 import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.persistent.PersistentTasksCustomMetadata;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
+import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
 import org.opensearch.search.SearchHit;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -47,7 +52,16 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         refresh(TRACES_INDEX);
         assertEquals("two spans indexed", 2, searchAll(TRACES_INDEX).getHits().getTotalHits().value());
 
-        builder().run();
+        builder("f").run();
+        assertFalse("an unrelated prefix must not create observations",
+            client().admin().indices().prepareExists(SERVICE_MAP_INDEX).get().isExists());
+
+        ServiceMapBuilder matchingBuilder = builder("0");
+        assertBusy(() -> {
+            matchingBuilder.run();
+            assertTrue("service-map index should be created after the discovery delay",
+                client().admin().indices().prepareExists(SERVICE_MAP_INDEX).get().isExists());
+        }, 10, TimeUnit.SECONDS);
         refresh(SERVICE_MAP_INDEX);
         assertV2Mapping();
 
@@ -81,6 +95,26 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         assertTrue("leaf document present", hasLeaf);
     }
 
+    public void testPersistentTasksCoverAllTraceIdPrefixes() throws Exception {
+        ClusterService clusterService = getInstanceFromNode(ClusterService.class);
+
+        assertBusy(() -> {
+            PersistentTasksCustomMetadata metadata = clusterService.state().metadata()
+                .custom(PersistentTasksCustomMetadata.TYPE);
+            assertNotNull(metadata);
+
+            Set<String> assignedPrefixes = new HashSet<>();
+            metadata.tasks().stream()
+                .filter(task -> ServiceMapTaskParams.NAME.equals(task.getTaskName()))
+                .forEach(task -> {
+                    assertTrue(task.getAssignment().isAssigned());
+                    assignedPrefixes.add(((ServiceMapTaskParams) task.getParams()).traceIdPrefix());
+                });
+            assertEquals(Set.of("0", "1", "2", "3", "4", "5", "6", "7",
+                "8", "9", "a", "b", "c", "d", "e", "f"), assignedPrefixes);
+        }, 30, TimeUnit.SECONDS);
+    }
+
     @SuppressWarnings("unchecked")
     private void assertV2Mapping() {
         GetMappingsResponse response = client().admin().indices()
@@ -99,13 +133,15 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    private ServiceMapBuilder builder() {
+    private ServiceMapBuilder builder(String traceIdPrefix) {
         return new ServiceMapBuilder(
             client(),
             getInstanceFromNode(org.opensearch.threadpool.ThreadPool.class),
             TRACES_INDEX,
             SERVICE_MAP_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
-            new TimeValue(5, TimeUnit.MINUTES));
+            new TimeValue(5, TimeUnit.MINUTES),
+            java.util.List.of(),
+            traceIdPrefix);
     }
 }

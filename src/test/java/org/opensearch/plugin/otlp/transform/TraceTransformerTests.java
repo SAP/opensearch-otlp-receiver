@@ -27,6 +27,9 @@ import org.opensearch.plugin.otlp.document.SpanDocument;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 
@@ -143,6 +146,22 @@ public class TraceTransformerTests extends OpenSearchTestCase {
                     .addSpans(Span.newBuilder(minimalSpan()).setName("span-2"))))
             .build();
         assertEquals(2, transformer.transform(req).size());
+    }
+
+    public void testAllSpansInRequestReceiveOneIndexedAtTimestamp() throws Exception {
+        Instant ingestionTime = Instant.parse("2026-11-11T08:15:30.123456789Z");
+        TraceTransformer fixedTransformer = new TraceTransformer(
+            Clock.fixed(ingestionTime, ZoneOffset.UTC));
+        ExportTraceServiceRequest req = ExportTraceServiceRequest.newBuilder()
+            .addResourceSpans(ResourceSpans.newBuilder()
+                .addScopeSpans(ScopeSpans.newBuilder()
+                    .addSpans(minimalSpan())
+                    .addSpans(Span.newBuilder(minimalSpan()).setName("span-2"))))
+            .build();
+
+        for (SpanDocument document : fixedTransformer.transform(req)) {
+            assertEquals(ingestionTime.toString(), toMap(document).get("indexedAt"));
+        }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

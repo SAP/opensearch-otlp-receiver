@@ -99,12 +99,16 @@ All available plugin settings:
 | `plugins.otlp.service_map.enabled` | `true` | Generate APM v2 service-map observations from recent spans |
 | `plugins.otlp.service_map.index` | `otel-v2-apm-service-map` | Service-map write index |
 | `plugins.otlp.service_map.interval` | `60s` | Interval between service-map correlation runs |
-| `plugins.otlp.service_map.lookback_window` | `5m` | Overlapping span window used to correlate late and out-of-order spans |
+| `plugins.otlp.service_map.lookback_window` | `5m` | Initial discovery window and trace-tombstone retention for late spans |
 | `plugins.otlp.service_map.group_by_attributes` | `[]` | Resource attributes copied into each node's `groupByAttributes` |
 
 Service-map nodes derive their environment from OpenTelemetry cloud and deployment
-resource attributes and fall back to `generic:default`. The overlapping lookback
-window should be longer than the maximum expected span delivery delay.
+resource attributes and fall back to `generic:default`. The lookback window should
+be longer than the maximum expected span delivery delay. Service-map
+correlation is split into 16 persistent tasks by the first hexadecimal character of
+`traceId`; OpenSearch assigns those partitions to data nodes and reassigns them when
+a node leaves the cluster. See the [distributed service-map task design](docs/service-map-tasks.md)
+for assignment, retry, and scaling details.
 
 The gRPC port, bind address, and TLS settings are controlled by OpenSearch's `transport-grpc` module, not by the plugin itself. See the [transport-grpc documentation](https://opensearch.org/docs/latest/install-and-configure/configuring-opensearch/network-settings/) for the full list of options.
 

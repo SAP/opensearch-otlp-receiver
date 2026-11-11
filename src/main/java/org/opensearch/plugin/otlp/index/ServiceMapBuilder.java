@@ -14,6 +14,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -22,6 +23,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.SortOrder;
@@ -33,6 +35,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
@@ -49,12 +52,18 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.Cursor;
+import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.TraceTombstone;
 
 /** Builds OpenSearch APM v2 service-map observations from recently indexed spans. */
 public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static final Logger LOG = LogManager.getLogger(ServiceMapBuilder.class);
     private static final int PAGE_SIZE = 10_000;
+    private static final TimeValue DISCOVERY_DELAY = TimeValue.timeValueSeconds(2);
+    private static final TimeValue CURSOR_OVERLAP = TimeValue.timeValueSeconds(10);
     private static final String DEFAULT_ENVIRONMENT = "generic:default";
     private static final String CLIENT_KIND = "SPAN_KIND_CLIENT";
     private static final String SERVER_KIND = "SPAN_KIND_SERVER";
@@ -62,7 +71,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static final String[] SOURCE_FIELDS = {
         "traceId", "spanId", "parentSpanId", "serviceName", "kind", "name",
-        "startTime", "attributes", "resource.attributes"
+        "startTime", "endTime", "indexedAt", "attributes", "resource.attributes"
     };
 
     private final Client client;
@@ -72,10 +81,13 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final TimeValue interval;
     private final TimeValue lookbackWindow;
     private final List<String> groupByAttributes;
+    private final String traceIdPrefix;
     private final Clock clock;
+    private final ServiceMapStateStore stateStore;
 
     private Scheduler.Cancellable scheduledTask;
     private final Cancellable cancellable = new Cancellable();
+    private final AtomicBoolean runInProgress = new AtomicBoolean();
 
     public ServiceMapBuilder(
             Client client,
@@ -96,7 +108,20 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             TimeValue lookbackWindow,
             List<String> groupByAttributes) {
         this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, Clock.systemUTC());
+            groupByAttributes, null, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client));
+    }
+
+    public ServiceMapBuilder(
+            Client client,
+            ThreadPool threadPool,
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes,
+            String traceIdPrefix) {
+        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
+            groupByAttributes, traceIdPrefix, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client));
     }
 
     ServiceMapBuilder(
@@ -108,6 +133,35 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             TimeValue lookbackWindow,
             List<String> groupByAttributes,
             Clock clock) {
+        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
+            groupByAttributes, null, clock, new LocalStateStore());
+    }
+
+    ServiceMapBuilder(
+            Client client,
+            ThreadPool threadPool,
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            Clock clock) {
+        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
+            groupByAttributes, traceIdPrefix, clock, new LocalStateStore());
+    }
+
+    ServiceMapBuilder(
+            Client client,
+            ThreadPool threadPool,
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            Clock clock,
+            ServiceMapStateStore stateStore) {
         this.client = client;
         this.threadPool = threadPool;
         this.tracesIndex = tracesIndex;
@@ -115,7 +169,9 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         this.interval = interval;
         this.lookbackWindow = lookbackWindow;
         this.groupByAttributes = List.copyOf(groupByAttributes);
+        this.traceIdPrefix = traceIdPrefix;
         this.clock = clock;
+        this.stateStore = stateStore;
     }
 
     @Override
@@ -138,33 +194,49 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     protected void doClose() {}
 
     public void run() {
-        if (cancellable.isCancelled()) {
+        if (cancellable.isCancelled() || !runInProgress.compareAndSet(false, true)) {
             return;
         }
         try {
-            Instant observationTime = clock.instant();
-            LOG.debug("ServiceMapBuilder: scanning [{}*] over lookback {}", tracesIndex, lookbackWindow);
-            buildServiceMap(loadRecentSpans(), observationTime);
+            Instant now = clock.instant();
+            LOG.debug("ServiceMapBuilder: discovering new spans in [{}*] for trace prefix [{}]",
+                tracesIndex, traceIdPrefix);
+            processIncremental(now);
         } catch (Exception e) {
             if (cancellable.isCancelled()) {
                 LOG.debug("ServiceMapBuilder tick interrupted by shutdown", e);
             } else {
                 LOG.warn("ServiceMapBuilder tick failed", e);
             }
+        } finally {
+            runInProgress.set(false);
         }
     }
 
-    private Map<String, Map<String, SpanData>> loadRecentSpans() throws Exception {
-        Map<String, Map<String, SpanData>> spansByTrace = new LinkedHashMap<>();
+    private void processIncremental(Instant now) throws Exception {
+        String partition = traceIdPrefix == null ? "all" : traceIdPrefix;
+        Cursor cursor = stateStore.loadCursor(partition);
+        Instant lowerBound = cursor == null
+            ? now.minusMillis(lookbackWindow.millis())
+            : cursor.indexedAt().minusMillis(Math.min(CURSOR_OVERLAP.millis(), lookbackWindow.millis()));
+        Instant upperBound = now.minusMillis(DISCOVERY_DELAY.millis());
         Object[] searchAfter = null;
 
         do {
+            QueryBuilder query = QueryBuilders.rangeQuery("indexedAt")
+                .gte(lowerBound.toString())
+                .lte(upperBound.toString());
+            if (traceIdPrefix != null) {
+                query = QueryBuilders.boolQuery()
+                    .filter(query)
+                    .filter(QueryBuilders.prefixQuery("traceId", traceIdPrefix));
+            }
+
             SearchSourceBuilder source = new SearchSourceBuilder()
                 .size(PAGE_SIZE)
-                .fetchSource(SOURCE_FIELDS, null)
-                .query(QueryBuilders.rangeQuery("startTime")
-                    .gte("now-" + lookbackWindow.seconds() + "s"))
-                .sort("startTime", SortOrder.ASC)
+                .fetchSource(new String[]{"traceId", "indexedAt"}, null)
+                .query(query)
+                .sort("indexedAt", SortOrder.ASC)
                 .sort("_id", SortOrder.ASC);
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
@@ -176,29 +248,85 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 break;
             }
 
+            Set<String> traceIds = new HashSet<>();
             for (SearchHit hit : hits) {
-                SpanData span = parseSpan(hit.getSourceAsMap());
-                if (span == null) {
-                    continue;
+                String traceId = stringValue(hit.getSourceAsMap().get("traceId"));
+                if (traceId != null) {
+                    traceIds.add(traceId);
                 }
-                spansByTrace.computeIfAbsent(span.traceId, ignored -> new LinkedHashMap<>())
-                    .put(span.spanId, span);
             }
+            Map<String, Map<String, SpanData>> spansByTrace = loadTraces(traceIds);
+            Set<String> previouslyProcessed = stateStore.loadProcessedTraceIds(traceIds);
+            reconcile(spansByTrace, previouslyProcessed);
+
+            SearchHit last = hits[hits.length - 1];
+            Instant lastIndexedAt = parseInstant(last.getSourceAsMap().get("indexedAt"));
+            if (lastIndexedAt == null) {
+                throw new IllegalStateException("Discovered span has no indexedAt value");
+            }
+            cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
+            stateStore.commit(partition, cursor, tombstones(spansByTrace, now));
 
             searchAfter = hits[hits.length - 1].getSortValues();
             if (hits.length < PAGE_SIZE) {
                 break;
             }
         } while (true);
+        stateStore.deleteExpired(partition, now);
+    }
 
+    private static Cursor maxCursor(Cursor current, Cursor candidate) {
+        if (current == null) {
+            return candidate;
+        }
+        int timeComparison = candidate.indexedAt().compareTo(current.indexedAt());
+        if (timeComparison > 0
+                || (timeComparison == 0 && candidate.documentId().compareTo(current.documentId()) > 0)) {
+            return candidate;
+        }
+        return current;
+    }
+
+    private Map<String, Map<String, SpanData>> loadTraces(Set<String> traceIds) throws Exception {
+        Map<String, Map<String, SpanData>> spansByTrace = new LinkedHashMap<>();
+        if (traceIds.isEmpty()) {
+            return spansByTrace;
+        }
+        Object[] searchAfter = null;
+        do {
+            SearchSourceBuilder source = new SearchSourceBuilder()
+                .size(PAGE_SIZE)
+                .fetchSource(SOURCE_FIELDS, null)
+                .query(QueryBuilders.termsQuery("traceId", traceIds))
+                .sort("_index", SortOrder.ASC)
+                .sort("_id", SortOrder.ASC);
+            if (searchAfter != null) {
+                source.searchAfter(searchAfter);
+            }
+            SearchHit[] hits = search(new SearchRequest(tracesIndex + "*").source(source))
+                .get().getHits().getHits();
+            for (SearchHit hit : hits) {
+                SpanData span = parseSpan(hit.getSourceAsMap());
+                if (span != null) {
+                    spansByTrace.computeIfAbsent(span.traceId, ignored -> new LinkedHashMap<>())
+                        .put(span.spanId, span);
+                }
+            }
+            if (hits.length < PAGE_SIZE) {
+                break;
+            }
+            searchAfter = hits[hits.length - 1].getSortValues();
+        } while (true);
         return spansByTrace;
     }
 
-    private void buildServiceMap(Map<String, Map<String, SpanData>> spansByTrace, Instant observationTime)
-            throws Exception {
+    private void reconcile(
+            Map<String, Map<String, SpanData>> spansByTrace, Set<String> previouslyProcessed) throws Exception {
         Map<String, Map<String, Object>> documentsById = new LinkedHashMap<>();
+        Set<String> deletesById = new HashSet<>();
 
-        for (Map<String, SpanData> spansById : spansByTrace.values()) {
+        for (Map.Entry<String, Map<String, SpanData>> trace : spansByTrace.entrySet()) {
+            Map<String, SpanData> spansById = trace.getValue();
             Map<String, List<SpanData>> childrenByParent = indexChildren(spansById.values());
 
             for (SpanData clientSpan : spansById.values()) {
@@ -212,20 +340,26 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                             || clientSpan.serviceName.equals(serverSpan.serviceName)) {
                         continue;
                     }
-                    addEdgeDocument(documentsById, clientSpan, serverSpan, spansById, observationTime);
+                    addEdgeDocument(documentsById, clientSpan, serverSpan, spansById);
                 }
             }
 
             for (SpanData serverSpan : spansById.values()) {
-                if (SERVER_KIND.equals(serverSpan.kind)
-                        && serverSpan.serviceName != null
-                        && !hasClientDescendant(serverSpan, childrenByParent)) {
-                    addLeafDocument(documentsById, serverSpan, observationTime);
+                if (!SERVER_KIND.equals(serverSpan.kind) || serverSpan.serviceName == null) {
+                    continue;
+                }
+                if (hasClientDescendant(serverSpan, childrenByParent)) {
+                    if (!previouslyProcessed.contains(trace.getKey())) {
+                        continue;
+                    }
+                    deletesById.add(leafDocumentId(serverSpan));
+                } else {
+                    addLeafDocument(documentsById, serverSpan);
                 }
             }
         }
 
-        if (documentsById.isEmpty()) {
+        if (documentsById.isEmpty() && deletesById.isEmpty()) {
             return;
         }
 
@@ -234,20 +368,22 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             bulk.add(new IndexRequest(serviceMapIndex).id(entry.getKey())
                 .source(entry.getValue(), XContentType.JSON));
         }
+        for (String id : deletesById) {
+            bulk.add(new DeleteRequest(serviceMapIndex, id));
+        }
         BulkResponse response = bulkIndex(bulk).get();
         if (response.hasFailures()) {
             throw new IllegalStateException("Failed to index service-map observations: "
                 + response.buildFailureMessage());
         }
-        LOG.debug("ServiceMapBuilder: indexed {} v2 observations", bulk.numberOfActions());
+        LOG.debug("ServiceMapBuilder: reconciled {} v2 observations", bulk.numberOfActions());
     }
 
     private void addEdgeDocument(
             Map<String, Map<String, Object>> documentsById,
             SpanData clientSpan,
             SpanData serverSpan,
-            Map<String, SpanData> spansById,
-            Instant observationTime) {
+            Map<String, SpanData> spansById) {
         NodeIdentity sourceNode = nodeFor(clientSpan);
         NodeIdentity targetNode = nodeFor(serverSpan);
         String sourceOperation = findEntryOperation(clientSpan, spansById);
@@ -255,28 +391,53 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         String nodeHash = String.valueOf(Objects.hash(sourceNode, targetNode));
         String operationHash = String.valueOf(Objects.hash(
             sourceNode, targetNode, sourceOperation, targetOperation));
-        String timestamp = DateTimeFormatter.ISO_INSTANT.format(observationTime);
+        Instant bucket = eventTimeBucket(clientSpan);
+        String timestamp = DateTimeFormatter.ISO_INSTANT.format(bucket);
 
         Map<String, Object> document = document(
             sourceNode, targetNode, sourceOperation, targetOperation, nodeHash, operationHash, timestamp);
-        String id = sha256Hex(String.join("\u0000", nodeHash, operationHash, timestamp,
-            clientSpan.traceId, clientSpan.spanId, serverSpan.spanId));
+        String id = edgeDocumentId(clientSpan, serverSpan, bucket);
         documentsById.put(id, document);
     }
 
     private void addLeafDocument(
-            Map<String, Map<String, Object>> documentsById, SpanData serverSpan, Instant observationTime) {
+            Map<String, Map<String, Object>> documentsById, SpanData serverSpan) {
         NodeIdentity sourceNode = nodeFor(serverSpan);
         String sourceOperation = serverSpan.operationName;
         String nodeHash = String.valueOf(Objects.hash(sourceNode, null));
         String operationHash = String.valueOf(Objects.hash(sourceNode, null, sourceOperation, null));
-        String timestamp = DateTimeFormatter.ISO_INSTANT.format(observationTime);
+        Instant bucket = eventTimeBucket(serverSpan);
+        String timestamp = DateTimeFormatter.ISO_INSTANT.format(bucket);
 
         Map<String, Object> document = document(
             sourceNode, null, sourceOperation, null, nodeHash, operationHash, timestamp);
-        String id = sha256Hex(String.join("\u0000", nodeHash, operationHash, timestamp,
-            serverSpan.traceId, serverSpan.spanId));
+        String id = leafDocumentId(serverSpan, bucket);
         documentsById.put(id, document);
+    }
+
+    private String leafDocumentId(SpanData serverSpan) {
+        return leafDocumentId(serverSpan, eventTimeBucket(serverSpan));
+    }
+
+    private static String edgeDocumentId(SpanData clientSpan, SpanData serverSpan, Instant bucket) {
+        return sha256Hex(String.join("\u0000", "service-map-edge-v1", clientSpan.traceId,
+            clientSpan.spanId, serverSpan.spanId, bucket.toString()));
+    }
+
+    private static String leafDocumentId(SpanData serverSpan, Instant bucket) {
+        return sha256Hex(String.join("\u0000", "service-map-leaf-v1", serverSpan.traceId,
+            serverSpan.spanId, bucket.toString()));
+    }
+
+    private Instant eventTimeBucket(SpanData span) {
+        Instant eventTime = span.endTime != null ? span.endTime
+            : span.indexedAt != null ? span.indexedAt : Instant.EPOCH;
+        long intervalMillis = interval.millis();
+        if (intervalMillis <= 0) {
+            return eventTime;
+        }
+        return Instant.ofEpochMilli(
+            Math.floorDiv(eventTime.toEpochMilli(), intervalMillis) * intervalMillis);
     }
 
     private static Map<String, Object> document(
@@ -377,8 +538,31 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             stringValue(source.get("serviceName")),
             stringValue(source.get("kind")),
             stringValue(source.get("name")),
+            parseInstant(source.get("endTime")),
+            parseInstant(source.get("indexedAt")),
             deriveEnvironment(spanAttributes, resourceAttributes),
             groups);
+    }
+
+    private Collection<TraceTombstone> tombstones(
+            Map<String, Map<String, SpanData>> spansByTrace, Instant now) {
+        List<TraceTombstone> tombstones = new ArrayList<>(spansByTrace.size());
+        for (Map.Entry<String, Map<String, SpanData>> trace : spansByTrace.entrySet()) {
+            Instant lastIndexedAt = trace.getValue().values().stream()
+                .map(SpanData::indexedAt)
+                .filter(Objects::nonNull)
+                .max(Instant::compareTo)
+                .orElse(now);
+            boolean rootSeen = trace.getValue().values().stream()
+                .anyMatch(span -> span.parentSpanId == null);
+            tombstones.add(new TraceTombstone(
+                trace.getKey(),
+                lastIndexedAt,
+                now.toEpochMilli(),
+                rootSeen,
+                lastIndexedAt.plusMillis(lookbackWindow.millis())));
+        }
+        return tombstones;
     }
 
     private static boolean isGroupValue(Object value) {
@@ -449,6 +633,20 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static String stringValue(Object value) {
         return value instanceof String string && !string.isBlank() ? string : null;
+    }
+
+    private static Instant parseInstant(Object value) {
+        if (value instanceof String string) {
+            try {
+                return Instant.parse(string);
+            } catch (DateTimeException ignored) {
+                return null;
+            }
+        }
+        if (value instanceof Number number) {
+            return Instant.ofEpochMilli(number.longValue());
+        }
+        return null;
     }
 
     private static Map<String, Object> objectMap(Object value) {
@@ -523,8 +721,36 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         String serviceName,
         String kind,
         String operationName,
+        Instant endTime,
+        Instant indexedAt,
         String environment,
         Map<String, Object> groupByAttributes) {}
+
+    private static final class LocalStateStore implements ServiceMapStateStore {
+        private final Map<String, Cursor> cursors = new HashMap<>();
+        private final Set<String> processedTraceIds = new HashSet<>();
+
+        @Override
+        public Cursor loadCursor(String prefix) {
+            return cursors.get(prefix);
+        }
+
+        @Override
+        public Set<String> loadProcessedTraceIds(Collection<String> traceIds) {
+            Set<String> result = new HashSet<>(traceIds);
+            result.retainAll(processedTraceIds);
+            return result;
+        }
+
+        @Override
+        public void commit(String prefix, Cursor cursor, Collection<TraceTombstone> tombstones) {
+            cursors.put(prefix, cursor);
+            tombstones.stream().map(TraceTombstone::traceId).forEach(processedTraceIds::add);
+        }
+
+        @Override
+        public void deleteExpired(String prefix, Instant now) {}
+    }
 
     private record KeyAttributes(String environment, String name) {
         @Override

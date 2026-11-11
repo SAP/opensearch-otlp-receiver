@@ -12,6 +12,7 @@ package org.opensearch.plugin.otlp.index;
 
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -28,6 +29,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
 
     private static final Instant FIRST_TICK = Instant.parse("2026-10-16T12:00:00Z");
     private static final Instant SECOND_TICK = Instant.parse("2026-10-16T12:01:00Z");
+    private static final Instant EVENT_BUCKET = Instant.parse("2026-10-16T11:59:00Z");
 
     public void testCrossServiceClientServerPairEmitsEdgeAndLeaf() {
         Map<String, Object> clientSpan = span(
@@ -48,7 +50,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertNode(edge, "targetNode", "checkout", "generic:default");
         assertEquals("POST /checkout", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
         assertEquals("Checkout", ((Map<String, Object>) edge.get("targetOperation")).get("name"));
-        assertEquals(FIRST_TICK.toString(), edge.get("timestamp"));
+        assertEquals(EVENT_BUCKET.toString(), edge.get("timestamp"));
         assertNotNull(edge.get("nodeConnectionHash"));
         assertNotNull(edge.get("operationConnectionHash"));
 
@@ -91,8 +93,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         Map<String, Object> serverSpan = span(
             "trace-late", "server", "client", "backend", "SPAN_KIND_SERVER", "late handler");
         TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
-            List.of(serverSpan),
-            List.of(clientSpan, serverSpan)));
+            List.of(serverSpan), List.of(serverSpan),
+            List.of(clientSpan, serverSpan), List.of(clientSpan, serverSpan)));
         ServiceMapBuilder builder = builder(client, FIRST_TICK, List.of());
 
         builder.run();
@@ -103,12 +105,11 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             .anyMatch(document -> document.get("targetNode") != null));
         assertTrue(documents(client.bulkRequests.get(1)).stream()
             .anyMatch(document -> document.get("targetNode") != null));
-        assertTrue("every tick uses the full overlap window",
-            client.searchRequests.stream().allMatch(request ->
-                request.source().query().toString().contains("now-300s")));
+        assertTrue("discovery is driven by the ingestion timestamp",
+            client.searchRequests.get(0).source().query().toString().contains("indexedAt"));
     }
 
-    public void testHashesAreStableWhileTimestampedIdsPreserveHistory() {
+    public void testRelationshipIdsAreIndependentOfProcessingTime() {
         List<Map<String, Object>> spans = List.of(
             span("trace-history", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
             span("trace-history", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
@@ -124,8 +125,40 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         Map<String, Object> secondSource = second.sourceAsMap();
         assertEquals(firstSource.get("nodeConnectionHash"), secondSource.get("nodeConnectionHash"));
         assertEquals(firstSource.get("operationConnectionHash"), secondSource.get("operationConnectionHash"));
-        assertNotEquals("observation IDs include time and do not overwrite history", first.id(), second.id());
-        assertNotEquals(firstSource.get("timestamp"), secondSource.get("timestamp"));
+        assertEquals("the same relationship overwrites on retry", first.id(), second.id());
+        assertEquals(firstSource.get("timestamp"), secondSource.get("timestamp"));
+    }
+
+    public void testRetriesWithinIntervalUseStableTimestampAndIds() {
+        List<Map<String, Object>> spans = List.of(
+            span("a0000000000000000000000000000000", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("a0000000000000000000000000000000", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient firstClient = stub(spans);
+        TraceGroupEnricherTests.StubClient retryClient = stub(spans);
+
+        builder(firstClient, FIRST_TICK.plusSeconds(5), List.of()).run();
+        builder(retryClient, FIRST_TICK.plusSeconds(55), List.of()).run();
+
+        IndexRequest first = edgeRequest(onlyBulk(firstClient));
+        IndexRequest retry = edgeRequest(onlyBulk(retryClient));
+        assertEquals(EVENT_BUCKET.toString(), first.sourceAsMap().get("timestamp"));
+        assertEquals(first.sourceAsMap().get("timestamp"), retry.sourceAsMap().get("timestamp"));
+        assertEquals("retry in one interval overwrites the same observation", first.id(), retry.id());
+    }
+
+    public void testTraceIdPrefixIsAppliedToSearch() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("a0000000000000000000000000000000", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of(), "a").run();
+
+        String query = client.searchRequests.get(0).source().query().toString();
+        assertTrue(query, query.contains("prefix"));
+        assertTrue(query, query.contains("traceId"));
+        assertTrue(query, query.contains("\"value\" : \"a\""));
     }
 
     public void testEnvironmentAndConfiguredGroupingAttributesAreEmitted() {
@@ -162,12 +195,73 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertEquals("POST /orders", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
     }
 
+    public void testLateClientDescendantDeletesPreviouslyEmittedLeaf() {
+        Map<String, Object> server = span(
+            "trace-leaf", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
+        Map<String, Object> internal = span(
+            "trace-leaf", "internal", "server", "checkout", "SPAN_KIND_INTERNAL", "work");
+        Map<String, Object> lateClient = span(
+            "trace-leaf", "client", "internal", "checkout", "SPAN_KIND_CLIENT", "HTTP GET");
+        lateClient.put("indexedAt", FIRST_TICK.plusSeconds(20).toString());
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            List.of(server, internal), List.of(server, internal),
+            List.of(lateClient), List.of(server, internal, lateClient)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK.plusSeconds(30), List.of());
+
+        builder.run();
+        String leafId = ((IndexRequest) client.bulkRequests.get(0).requests().get(0)).id();
+        builder.run();
+
+        BulkRequest correction = client.bulkRequests.get(1);
+        DeleteRequest delete = correction.requests().stream()
+            .filter(DeleteRequest.class::isInstance)
+            .map(DeleteRequest.class::cast)
+            .findFirst().orElseThrow();
+        assertEquals("the deterministic leaf ID can be derived without metadata", leafId, delete.id());
+    }
+
+    public void testLateEntrySpanOverwritesEdgeWithCorrectedSourceOperation() {
+        Map<String, Object> clientCall = span(
+            "trace-operation", "client", "entry", "frontend",
+            "SPAN_KIND_CLIENT", "HTTP GET");
+        Map<String, Object> downstream = span(
+            "trace-operation", "downstream", "client", "inventory",
+            "SPAN_KIND_SERVER", "Reserve");
+        Map<String, Object> lateEntry = span(
+            "trace-operation", "entry", null, "frontend",
+            "SPAN_KIND_SERVER", "POST /orders");
+        lateEntry.put("indexedAt", FIRST_TICK.plusSeconds(20).toString());
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            List.of(clientCall, downstream), List.of(clientCall, downstream),
+            List.of(lateEntry), List.of(lateEntry, clientCall, downstream)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK.plusSeconds(30), List.of());
+
+        builder.run();
+        IndexRequest original = edgeRequest(client.bulkRequests.get(0));
+        builder.run();
+        IndexRequest corrected = edgeRequest(client.bulkRequests.get(1));
+
+        assertEquals(original.id(), corrected.id());
+        assertEquals("HTTP GET",
+            ((Map<String, Object>) original.sourceAsMap().get("sourceOperation")).get("name"));
+        assertEquals("POST /orders",
+            ((Map<String, Object>) corrected.sourceAsMap().get("sourceOperation")).get("name"));
+    }
+
     private static TraceGroupEnricherTests.StubClient stub(List<Map<String, Object>> spans) {
-        return new TraceGroupEnricherTests.StubClient(List.of(spans));
+        return new TraceGroupEnricherTests.StubClient(List.of(spans, spans));
     }
 
     private static ServiceMapBuilder builder(
             TraceGroupEnricherTests.StubClient client, Instant time, List<String> groupByAttributes) {
+        return builder(client, time, groupByAttributes, null);
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
+            List<String> groupByAttributes,
+            String traceIdPrefix) {
         return new ServiceMapBuilder(
             client,
             null,
@@ -176,6 +270,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             new TimeValue(60, TimeUnit.SECONDS),
             new TimeValue(5, TimeUnit.MINUTES),
             groupByAttributes,
+            traceIdPrefix,
             Clock.fixed(time, ZoneOffset.UTC));
     }
 
@@ -195,6 +290,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         span.put("serviceName", serviceName);
         span.put("kind", kind);
         span.put("name", name);
+        span.put("endTime", FIRST_TICK.minusSeconds(30).toString());
+        span.put("indexedAt", FIRST_TICK.minusSeconds(10).toString());
         return span;
     }
 
@@ -205,6 +302,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
 
     private static List<Map<String, Object>> documents(BulkRequest bulk) {
         return bulk.requests().stream()
+            .filter(IndexRequest.class::isInstance)
             .map(request -> ((IndexRequest) request).sourceAsMap())
             .toList();
     }
