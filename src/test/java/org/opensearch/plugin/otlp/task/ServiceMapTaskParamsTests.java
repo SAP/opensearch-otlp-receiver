@@ -58,10 +58,11 @@ public class ServiceMapTaskParamsTests extends OpenSearchTestCase {
     private static ServiceMapTaskParams params() {
         return new ServiceMapTaskParams(
             "a",
-            "otel-v1-apm-span",
-            "otel-v2-apm-service-map",
-            60_000L,
-            300_000L,
-            List.of("service.version", "k8s.cluster.name"));
+            new ServiceMapGenerationConfig(
+                "otel-v1-apm-span",
+                "otel-v2-apm-service-map",
+                60_000L,
+                300_000L,
+                List.of("service.version", "k8s.cluster.name")));
     }
 }

@@ -54,17 +54,12 @@ public final class ServiceMapTaskCoordinator extends AbstractLifecycleComponent 
             ClusterService clusterService,
             ThreadPool threadPool,
             boolean enabled,
-            String tracesIndex,
-            String serviceMapIndex,
-            TimeValue interval,
-            TimeValue lookbackWindow,
-            List<String> groupByAttributes) {
+            ServiceMapGenerationConfig config) {
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.tasksService = new PersistentTasksService(clusterService, threadPool, client);
         this.enabled = enabled;
-        this.desiredTasks = desiredTasks(
-            tracesIndex, serviceMapIndex, interval, lookbackWindow, groupByAttributes);
+        this.desiredTasks = desiredTasks(config);
     }
 
     @Override
@@ -205,21 +200,10 @@ public final class ServiceMapTaskCoordinator extends AbstractLifecycleComponent 
         return TASK_ID_PREFIX + prefix;
     }
 
-    private static List<ServiceMapTaskParams> desiredTasks(
-            String tracesIndex,
-            String serviceMapIndex,
-            TimeValue interval,
-            TimeValue lookbackWindow,
-            List<String> groupByAttributes) {
+    private static List<ServiceMapTaskParams> desiredTasks(ServiceMapGenerationConfig config) {
         List<ServiceMapTaskParams> tasks = new ArrayList<>(PREFIX_PARTITIONS);
         for (int partition = 0; partition < PREFIX_PARTITIONS; partition++) {
-            tasks.add(new ServiceMapTaskParams(
-                Integer.toHexString(partition),
-                tracesIndex,
-                serviceMapIndex,
-                interval.millis(),
-                lookbackWindow.millis(),
-                groupByAttributes));
+            tasks.add(new ServiceMapTaskParams(Integer.toHexString(partition), config));
         }
         return List.copyOf(tasks);
     }

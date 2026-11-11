@@ -25,6 +25,7 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.plugin.otlp.server.OTLPGrpcServiceFactory;
 import org.opensearch.plugin.otlp.index.IndexTemplateManager;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricher;
+import org.opensearch.plugin.otlp.task.ServiceMapGenerationConfig;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskCoordinator;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskExecutor;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
@@ -90,17 +91,19 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin, Persiste
         boolean pluginEnabled = OTLPPluginSettings.ENABLED.get(settings);
         boolean serviceMapEnabled = pluginEnabled
             && OTLPPluginSettings.SERVICE_MAP_ENABLED.get(settings);
+        ServiceMapGenerationConfig serviceMapConfig = new ServiceMapGenerationConfig(
+            OTLPPluginSettings.TRACES_INDEX.get(settings),
+            OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
+            OTLPPluginSettings.SERVICE_MAP_INTERVAL.get(settings).millis(),
+            OTLPPluginSettings.SERVICE_MAP_LOOKBACK_WINDOW.get(settings).millis(),
+            OTLPPluginSettings.SERVICE_MAP_GROUP_BY_ATTRIBUTES.get(settings));
         List<Object> components = new ArrayList<>();
         components.add(new ServiceMapTaskCoordinator(
             client,
             clusterService,
             threadPool,
             serviceMapEnabled,
-            OTLPPluginSettings.TRACES_INDEX.get(settings),
-            OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
-            OTLPPluginSettings.SERVICE_MAP_INTERVAL.get(settings),
-            OTLPPluginSettings.SERVICE_MAP_LOOKBACK_WINDOW.get(settings),
-            OTLPPluginSettings.SERVICE_MAP_GROUP_BY_ATTRIBUTES.get(settings)));
+            serviceMapConfig));
 
         if (!pluginEnabled) {
             return components;

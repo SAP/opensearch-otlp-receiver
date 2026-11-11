@@ -52,14 +52,15 @@ public final class ServiceMapTaskExecutor extends PersistentTasksExecutor<Servic
             AllocatedPersistentTask task,
             ServiceMapTaskParams params,
             @Nullable PersistentTaskState state) {
+        ServiceMapGenerationConfig config = params.config();
         ServiceMapBuilder builder = new ServiceMapBuilder(
             client,
             threadPool,
-            params.tracesIndex(),
-            params.serviceMapIndex(),
-            TimeValue.timeValueMillis(params.intervalMillis()),
-            TimeValue.timeValueMillis(params.lookbackMillis()),
-            params.groupByAttributes(),
+            config.tracesIndex(),
+            config.serviceMapIndex(),
+            TimeValue.timeValueMillis(config.intervalMillis()),
+            TimeValue.timeValueMillis(config.lookbackMillis()),
+            config.groupByAttributes(),
             params.traceIdPrefix());
         if (((ServiceMapAllocatedTask) task).start(builder)) {
             threadPool.executor(ThreadPool.Names.GENERIC).execute(builder::run);

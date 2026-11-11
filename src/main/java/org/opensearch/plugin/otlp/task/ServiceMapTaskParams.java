@@ -29,63 +29,34 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
     public static final String NAME = "otlp_service_map";
 
     private final String traceIdPrefix;
-    private final String tracesIndex;
-    private final String serviceMapIndex;
-    private final long intervalMillis;
-    private final long lookbackMillis;
-    private final List<String> groupByAttributes;
+    private final ServiceMapGenerationConfig config;
 
-    public ServiceMapTaskParams(
-            String traceIdPrefix,
-            String tracesIndex,
-            String serviceMapIndex,
-            long intervalMillis,
-            long lookbackMillis,
-            List<String> groupByAttributes) {
+    public ServiceMapTaskParams(String traceIdPrefix, ServiceMapGenerationConfig config) {
         this.traceIdPrefix = Objects.requireNonNull(traceIdPrefix);
-        this.tracesIndex = Objects.requireNonNull(tracesIndex);
-        this.serviceMapIndex = Objects.requireNonNull(serviceMapIndex);
-        this.intervalMillis = intervalMillis;
-        this.lookbackMillis = lookbackMillis;
-        this.groupByAttributes = List.copyOf(groupByAttributes);
+        this.config = Objects.requireNonNull(config);
     }
 
     public ServiceMapTaskParams(StreamInput in) throws IOException {
-        this(in.readString(), in.readString(), in.readString(), in.readVLong(), in.readVLong(), in.readStringList());
+        this(in.readString(), new ServiceMapGenerationConfig(
+            in.readString(), in.readString(), in.readVLong(), in.readVLong(), in.readStringList()));
     }
 
     public String traceIdPrefix() {
         return traceIdPrefix;
     }
 
-    public String tracesIndex() {
-        return tracesIndex;
-    }
-
-    public String serviceMapIndex() {
-        return serviceMapIndex;
-    }
-
-    public long intervalMillis() {
-        return intervalMillis;
-    }
-
-    public long lookbackMillis() {
-        return lookbackMillis;
-    }
-
-    public List<String> groupByAttributes() {
-        return groupByAttributes;
+    public ServiceMapGenerationConfig config() {
+        return config;
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(traceIdPrefix);
-        out.writeString(tracesIndex);
-        out.writeString(serviceMapIndex);
-        out.writeVLong(intervalMillis);
-        out.writeVLong(lookbackMillis);
-        out.writeStringCollection(groupByAttributes);
+        out.writeString(config.tracesIndex());
+        out.writeString(config.serviceMapIndex());
+        out.writeVLong(config.intervalMillis());
+        out.writeVLong(config.lookbackMillis());
+        out.writeStringCollection(config.groupByAttributes());
     }
 
     @Override
@@ -102,11 +73,11 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
         builder.field("trace_id_prefix", traceIdPrefix);
-        builder.field("traces_index", tracesIndex);
-        builder.field("service_map_index", serviceMapIndex);
-        builder.field("interval_millis", intervalMillis);
-        builder.field("lookback_millis", lookbackMillis);
-        builder.field("group_by_attributes", groupByAttributes);
+        builder.field("traces_index", config.tracesIndex());
+        builder.field("service_map_index", config.serviceMapIndex());
+        builder.field("interval_millis", config.intervalMillis());
+        builder.field("lookback_millis", config.lookbackMillis());
+        builder.field("group_by_attributes", config.groupByAttributes());
         builder.endObject();
         return builder;
     }
@@ -122,11 +93,12 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
         }
         return new ServiceMapTaskParams(
             Objects.toString(values.get("trace_id_prefix")),
-            Objects.toString(values.get("traces_index")),
-            Objects.toString(values.get("service_map_index")),
-            ((Number) values.get("interval_millis")).longValue(),
-            ((Number) values.get("lookback_millis")).longValue(),
-            groups);
+            new ServiceMapGenerationConfig(
+                Objects.toString(values.get("traces_index")),
+                Objects.toString(values.get("service_map_index")),
+                ((Number) values.get("interval_millis")).longValue(),
+                ((Number) values.get("lookback_millis")).longValue(),
+                groups));
     }
 
     @Override
@@ -137,17 +109,11 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
         if (!(other instanceof ServiceMapTaskParams that)) {
             return false;
         }
-        return intervalMillis == that.intervalMillis
-            && lookbackMillis == that.lookbackMillis
-            && traceIdPrefix.equals(that.traceIdPrefix)
-            && tracesIndex.equals(that.tracesIndex)
-            && serviceMapIndex.equals(that.serviceMapIndex)
-            && groupByAttributes.equals(that.groupByAttributes);
+        return traceIdPrefix.equals(that.traceIdPrefix) && config.equals(that.config);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(traceIdPrefix, tracesIndex, serviceMapIndex,
-            intervalMillis, lookbackMillis, groupByAttributes);
+        return Objects.hash(traceIdPrefix, config);
     }
 }
