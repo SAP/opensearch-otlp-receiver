@@ -110,6 +110,11 @@ public final class ServiceMapTaskCoordinator extends AbstractLifecycleComponent 
                     taskId, existing.getTaskName());
                 continue;
             }
+            if (existing.getParams() instanceof ServiceMapTaskParams params && !params.isValid()) {
+                LOG.warn("Removing malformed service-map task [{}]", taskId);
+                removeTask(taskId);
+                return;
+            }
             if (!desired.equals(existing.getParams())) {
                 LOG.info("Replacing service-map task [{}] because its configuration changed", taskId);
                 removeTask(taskId);

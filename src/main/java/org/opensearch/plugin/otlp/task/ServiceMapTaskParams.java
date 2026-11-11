@@ -10,6 +10,8 @@
  */
 package org.opensearch.plugin.otlp.task;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.Version;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -27,6 +29,8 @@ import java.util.Objects;
 public final class ServiceMapTaskParams implements PersistentTaskParams {
 
     public static final String NAME = "otlp_service_map";
+    private static final Logger LOG = LogManager.getLogger(ServiceMapTaskParams.class);
+    private static final String INVALID_VALUE = "";
 
     private final String traceIdPrefix;
     private final ServiceMapGenerationConfig config;
@@ -47,6 +51,15 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
 
     public ServiceMapGenerationConfig config() {
         return config;
+    }
+
+    boolean isValid() {
+        return traceIdPrefix.matches("[0-9a-f]+")
+            && !config.tracesIndex().isBlank()
+            && !config.serviceMapIndex().isBlank()
+            && config.intervalMillis() >= 0
+            && config.lookbackMillis() >= 0
+            && config.groupByAttributes().stream().noneMatch(String::isBlank);
     }
 
     @Override
@@ -84,21 +97,63 @@ public final class ServiceMapTaskParams implements PersistentTaskParams {
 
     public static ServiceMapTaskParams fromXContent(XContentParser parser) throws IOException {
         Map<String, Object> values = parser.map();
-        List<String> groups = new ArrayList<>();
-        Object rawGroups = values.get("group_by_attributes");
-        if (rawGroups instanceof List<?> list) {
-            for (Object value : list) {
-                groups.add(Objects.toString(value));
+        try {
+            return new ServiceMapTaskParams(
+                requiredString(values, "trace_id_prefix"),
+                new ServiceMapGenerationConfig(
+                    requiredString(values, "traces_index"),
+                    requiredString(values, "service_map_index"),
+                    requiredLong(values, "interval_millis"),
+                    requiredLong(values, "lookback_millis"),
+                    requiredStringList(values, "group_by_attributes")));
+        } catch (IllegalArgumentException e) {
+            LOG.warn("Loaded malformed service-map task parameters; the task will be replaced: {}",
+                e.getMessage());
+            return invalid();
+        }
+    }
+
+    private static String requiredString(Map<String, Object> values, String field) {
+        Object value = values.get(field);
+        if (value instanceof String string && !string.isBlank()) {
+            return string;
+        }
+        throw invalidField(field);
+    }
+
+    private static long requiredLong(Map<String, Object> values, String field) {
+        Object value = values.get(field);
+        if (value instanceof Number number) {
+            long result = number.longValue();
+            if (result >= 0 && number.doubleValue() == result) {
+                return result;
             }
         }
-        return new ServiceMapTaskParams(
-            Objects.toString(values.get("trace_id_prefix")),
-            new ServiceMapGenerationConfig(
-                Objects.toString(values.get("traces_index")),
-                Objects.toString(values.get("service_map_index")),
-                ((Number) values.get("interval_millis")).longValue(),
-                ((Number) values.get("lookback_millis")).longValue(),
-                groups));
+        throw invalidField(field);
+    }
+
+    private static List<String> requiredStringList(Map<String, Object> values, String field) {
+        Object value = values.get(field);
+        if (!(value instanceof List<?> list)) {
+            throw invalidField(field);
+        }
+        List<String> result = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (!(item instanceof String string) || string.isBlank()) {
+                throw invalidField(field);
+            }
+            result.add(string);
+        }
+        return result;
+    }
+
+    private static IllegalArgumentException invalidField(String field) {
+        return new IllegalArgumentException("missing or invalid field [" + field + "]");
+    }
+
+    private static ServiceMapTaskParams invalid() {
+        return new ServiceMapTaskParams(INVALID_VALUE,
+            new ServiceMapGenerationConfig(INVALID_VALUE, INVALID_VALUE, 0, 0, List.of()));
     }
 
     @Override

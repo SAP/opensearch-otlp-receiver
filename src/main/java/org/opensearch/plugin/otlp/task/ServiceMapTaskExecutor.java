@@ -52,6 +52,10 @@ public final class ServiceMapTaskExecutor extends PersistentTasksExecutor<Servic
             AllocatedPersistentTask task,
             ServiceMapTaskParams params,
             @Nullable PersistentTaskState state) {
+        if (!params.isValid()) {
+            task.markAsFailed(new IllegalArgumentException("Malformed service-map task parameters"));
+            return;
+        }
         ServiceMapGenerationConfig config = params.config();
         ServiceMapBuilder builder = new ServiceMapBuilder(
             client,
