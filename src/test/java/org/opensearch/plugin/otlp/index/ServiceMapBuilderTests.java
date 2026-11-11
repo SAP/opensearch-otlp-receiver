@@ -301,7 +301,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             new TimeValue(5, TimeUnit.MINUTES),
             groupByAttributes,
             traceIdPrefix,
-            Clock.fixed(time, ZoneOffset.UTC));
+            Clock.fixed(time, ZoneOffset.UTC),
+            new LocalServiceMapStateStore());
     }
 
     private static Map<String, Object> span(

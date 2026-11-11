@@ -135,33 +135,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             TimeValue interval,
             TimeValue lookbackWindow,
             List<String> groupByAttributes,
-            Clock clock) {
-        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, null, clock, new LocalStateStore());
-    }
-
-    ServiceMapBuilder(
-            Client client,
-            ThreadPool threadPool,
-            String tracesIndex,
-            String serviceMapIndex,
-            TimeValue interval,
-            TimeValue lookbackWindow,
-            List<String> groupByAttributes,
-            String traceIdPrefix,
-            Clock clock) {
-        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, traceIdPrefix, clock, new LocalStateStore());
-    }
-
-    ServiceMapBuilder(
-            Client client,
-            ThreadPool threadPool,
-            String tracesIndex,
-            String serviceMapIndex,
-            TimeValue interval,
-            TimeValue lookbackWindow,
-            List<String> groupByAttributes,
             String traceIdPrefix,
             Clock clock,
             ServiceMapStateStore stateStore) {
@@ -752,43 +725,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         Instant indexedAt,
         String environment,
         Map<String, Object> groupByAttributes) {}
-
-    private static final class LocalStateStore implements ServiceMapStateStore {
-        private final Map<Scope, Cursor> cursors = new HashMap<>();
-        private final Set<String> processedTraceIds = new HashSet<>();
-
-        @Override
-        public Cursor loadCursor(Scope scope) {
-            return cursors.get(scope);
-        }
-
-        @Override
-        public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) {
-            Set<String> result = new HashSet<>();
-            for (String traceId : traceIds) {
-                if (processedTraceIds.contains(processedTraceId(scope, traceId))) {
-                    result.add(traceId);
-                }
-            }
-            return result;
-        }
-
-        @Override
-        public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) {
-            cursors.put(scope, cursor);
-            tombstones.stream()
-                .map(TraceTombstone::traceId)
-                .map(traceId -> processedTraceId(scope, traceId))
-                .forEach(processedTraceIds::add);
-        }
-
-        @Override
-        public void deleteExpired(String prefix, Instant now) {}
-
-        private static String processedTraceId(Scope scope, String traceId) {
-            return scope.namespace() + "\u0000" + traceId;
-        }
-    }
 
     private record KeyAttributes(String environment, String name) {
         @Override
