@@ -8,7 +8,7 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
-package org.opensearch.plugin.otlp.index;
+package org.opensearch.plugin.otlp.servicemap;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -24,6 +24,7 @@ import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.plugin.otlp.common.Cancellable;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.SortOrder;
@@ -31,13 +32,9 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.Instant;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -54,9 +51,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.Cursor;
-import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.Scope;
-import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.TraceTombstone;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Cursor;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Scope;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.TraceTombstone;
 
 /** Builds OpenSearch APM v2 service-map observations from recently indexed spans. */
 public class ServiceMapBuilder extends AbstractLifecycleComponent {
@@ -86,6 +83,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final String traceIdPrefix;
     private final Clock clock;
     private final ServiceMapStateStore stateStore;
+    private final ServiceMapDocumentFactory documentFactory;
     private final String stateNamespace;
 
     private Scheduler.Cancellable scheduledTask;
@@ -148,6 +146,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         this.traceIdPrefix = traceIdPrefix;
         this.clock = clock;
         this.stateStore = stateStore;
+        this.documentFactory = new ServiceMapDocumentFactory(interval.millis());
         this.stateNamespace = stateNamespace(
             tracesIndex, serviceMapIndex, interval, lookbackWindow, groupByAttributes);
     }
@@ -234,7 +233,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                     traceIds.add(traceId);
                 }
             }
-            Map<String, Map<String, SpanData>> spansByTrace = loadTraces(traceIds);
+            Map<String, Map<String, ServiceMapSpan>> spansByTrace = loadTraces(traceIds);
             Set<String> previouslyProcessed = stateStore.loadProcessedTraceIds(scope, traceIds);
             reconcile(spansByTrace, previouslyProcessed);
 
@@ -266,8 +265,8 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return current;
     }
 
-    private Map<String, Map<String, SpanData>> loadTraces(Set<String> traceIds) throws Exception {
-        Map<String, Map<String, SpanData>> spansByTrace = new LinkedHashMap<>();
+    private Map<String, Map<String, ServiceMapSpan>> loadTraces(Set<String> traceIds) throws Exception {
+        Map<String, Map<String, ServiceMapSpan>> spansByTrace = new LinkedHashMap<>();
         if (traceIds.isEmpty()) {
             return spansByTrace;
         }
@@ -285,10 +284,10 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             SearchHit[] hits = search(new SearchRequest(tracesIndex + "*").source(source))
                 .get().getHits().getHits();
             for (SearchHit hit : hits) {
-                SpanData span = parseSpan(hit.getSourceAsMap());
+                ServiceMapSpan span = parseSpan(hit.getSourceAsMap());
                 if (span != null) {
-                    spansByTrace.computeIfAbsent(span.traceId, ignored -> new LinkedHashMap<>())
-                        .put(span.spanId, span);
+                    spansByTrace.computeIfAbsent(span.traceId(), ignored -> new LinkedHashMap<>())
+                        .put(span.spanId(), span);
                 }
             }
             if (hits.length < PAGE_SIZE) {
@@ -300,40 +299,43 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     }
 
     private void reconcile(
-            Map<String, Map<String, SpanData>> spansByTrace, Set<String> previouslyProcessed) throws Exception {
+            Map<String, Map<String, ServiceMapSpan>> spansByTrace, Set<String> previouslyProcessed) throws Exception {
         Map<String, Map<String, Object>> documentsById = new LinkedHashMap<>();
         Set<String> deletesById = new HashSet<>();
 
-        for (Map.Entry<String, Map<String, SpanData>> trace : spansByTrace.entrySet()) {
-            Map<String, SpanData> spansById = trace.getValue();
-            Map<String, List<SpanData>> childrenByParent = indexChildren(spansById.values());
+        for (Map.Entry<String, Map<String, ServiceMapSpan>> trace : spansByTrace.entrySet()) {
+            Map<String, ServiceMapSpan> spansById = trace.getValue();
+            Map<String, List<ServiceMapSpan>> childrenByParent = indexChildren(spansById.values());
 
-            for (SpanData clientSpan : spansById.values()) {
-                if (!CLIENT_KIND.equals(clientSpan.kind)) {
+            for (ServiceMapSpan clientSpan : spansById.values()) {
+                if (!CLIENT_KIND.equals(clientSpan.kind())) {
                     continue;
                 }
-                for (SpanData serverSpan : childrenByParent.getOrDefault(clientSpan.spanId, List.of())) {
-                    if (!SERVER_KIND.equals(serverSpan.kind)
-                            || clientSpan.serviceName == null
-                            || serverSpan.serviceName == null
-                            || clientSpan.serviceName.equals(serverSpan.serviceName)) {
+                for (ServiceMapSpan serverSpan : childrenByParent.getOrDefault(clientSpan.spanId(), List.of())) {
+                    if (!SERVER_KIND.equals(serverSpan.kind())
+                            || clientSpan.serviceName() == null
+                            || serverSpan.serviceName() == null
+                            || clientSpan.serviceName().equals(serverSpan.serviceName())) {
                         continue;
                     }
-                    addEdgeDocument(documentsById, clientSpan, serverSpan, spansById);
+                    ServiceMapDocumentFactory.GeneratedDocument document = documentFactory.edge(
+                        clientSpan, serverSpan, findEntryOperation(clientSpan, spansById));
+                    documentsById.put(document.id(), document.source());
                 }
             }
 
-            for (SpanData serverSpan : spansById.values()) {
-                if (!SERVER_KIND.equals(serverSpan.kind) || serverSpan.serviceName == null) {
+            for (ServiceMapSpan serverSpan : spansById.values()) {
+                if (!SERVER_KIND.equals(serverSpan.kind()) || serverSpan.serviceName() == null) {
                     continue;
                 }
                 if (hasClientDescendant(serverSpan, childrenByParent)) {
                     if (!previouslyProcessed.contains(trace.getKey())) {
                         continue;
                     }
-                    deletesById.add(leafDocumentId(serverSpan));
+                    deletesById.add(documentFactory.leafId(serverSpan));
                 } else {
-                    addLeafDocument(documentsById, serverSpan);
+                    ServiceMapDocumentFactory.GeneratedDocument document = documentFactory.leaf(serverSpan);
+                    documentsById.put(document.id(), document.source());
                 }
             }
         }
@@ -358,140 +360,51 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         LOG.debug("ServiceMapBuilder: reconciled {} v2 observations", bulk.numberOfActions());
     }
 
-    private void addEdgeDocument(
-            Map<String, Map<String, Object>> documentsById,
-            SpanData clientSpan,
-            SpanData serverSpan,
-            Map<String, SpanData> spansById) {
-        NodeIdentity sourceNode = nodeFor(clientSpan);
-        NodeIdentity targetNode = nodeFor(serverSpan);
-        String sourceOperation = findEntryOperation(clientSpan, spansById);
-        String targetOperation = serverSpan.operationName;
-        String nodeHash = String.valueOf(Objects.hash(sourceNode, targetNode));
-        String operationHash = String.valueOf(Objects.hash(
-            sourceNode, targetNode, sourceOperation, targetOperation));
-        Instant bucket = eventTimeBucket(clientSpan);
-        String timestamp = DateTimeFormatter.ISO_INSTANT.format(bucket);
-
-        Map<String, Object> document = document(
-            sourceNode, targetNode, sourceOperation, targetOperation, nodeHash, operationHash, timestamp);
-        String id = edgeDocumentId(clientSpan, serverSpan, bucket);
-        documentsById.put(id, document);
-    }
-
-    private void addLeafDocument(
-            Map<String, Map<String, Object>> documentsById, SpanData serverSpan) {
-        NodeIdentity sourceNode = nodeFor(serverSpan);
-        String sourceOperation = serverSpan.operationName;
-        String nodeHash = String.valueOf(Objects.hash(sourceNode, null));
-        String operationHash = String.valueOf(Objects.hash(sourceNode, null, sourceOperation, null));
-        Instant bucket = eventTimeBucket(serverSpan);
-        String timestamp = DateTimeFormatter.ISO_INSTANT.format(bucket);
-
-        Map<String, Object> document = document(
-            sourceNode, null, sourceOperation, null, nodeHash, operationHash, timestamp);
-        String id = leafDocumentId(serverSpan, bucket);
-        documentsById.put(id, document);
-    }
-
-    private String leafDocumentId(SpanData serverSpan) {
-        return leafDocumentId(serverSpan, eventTimeBucket(serverSpan));
-    }
-
-    private static String edgeDocumentId(SpanData clientSpan, SpanData serverSpan, Instant bucket) {
-        return sha256Hex(String.join("\u0000", "service-map-edge-v1", clientSpan.traceId,
-            clientSpan.spanId, serverSpan.spanId, bucket.toString()));
-    }
-
-    private static String leafDocumentId(SpanData serverSpan, Instant bucket) {
-        return sha256Hex(String.join("\u0000", "service-map-leaf-v1", serverSpan.traceId,
-            serverSpan.spanId, bucket.toString()));
-    }
-
-    private Instant eventTimeBucket(SpanData span) {
-        Instant eventTime = span.endTime != null ? span.endTime
-            : span.indexedAt != null ? span.indexedAt : Instant.EPOCH;
-        long intervalMillis = interval.millis();
-        if (intervalMillis <= 0) {
-            return eventTime;
-        }
-        return Instant.ofEpochMilli(
-            Math.floorDiv(eventTime.toEpochMilli(), intervalMillis) * intervalMillis);
-    }
-
-    private static Map<String, Object> document(
-            NodeIdentity sourceNode,
-            NodeIdentity targetNode,
-            String sourceOperation,
-            String targetOperation,
-            String nodeHash,
-            String operationHash,
-            String timestamp) {
-        Map<String, Object> document = new LinkedHashMap<>();
-        document.put("sourceNode", sourceNode.asMap());
-        document.put("targetNode", targetNode != null ? targetNode.asMap() : null);
-        document.put("sourceOperation", operation(sourceOperation));
-        document.put("targetOperation", targetOperation != null ? operation(targetOperation) : null);
-        document.put("nodeConnectionHash", nodeHash);
-        document.put("operationConnectionHash", operationHash);
-        document.put("timestamp", timestamp);
-        return document;
-    }
-
-    private static Map<String, Object> operation(String name) {
-        return Map.of("name", name != null ? name : "", "attributes", Map.of());
-    }
-
-    private NodeIdentity nodeFor(SpanData span) {
-        return new NodeIdentity("service",
-            new KeyAttributes(span.environment, span.serviceName), span.groupByAttributes);
-    }
-
-    private static Map<String, List<SpanData>> indexChildren(Collection<SpanData> spans) {
-        Map<String, List<SpanData>> childrenByParent = new HashMap<>();
-        for (SpanData span : spans) {
-            if (span.parentSpanId != null) {
-                childrenByParent.computeIfAbsent(span.parentSpanId, ignored -> new ArrayList<>()).add(span);
+    private static Map<String, List<ServiceMapSpan>> indexChildren(Collection<ServiceMapSpan> spans) {
+        Map<String, List<ServiceMapSpan>> childrenByParent = new HashMap<>();
+        for (ServiceMapSpan span : spans) {
+            if (span.parentSpanId() != null) {
+                childrenByParent.computeIfAbsent(span.parentSpanId(), ignored -> new ArrayList<>()).add(span);
             }
         }
         return childrenByParent;
     }
 
     private static boolean hasClientDescendant(
-            SpanData serverSpan, Map<String, List<SpanData>> childrenByParent) {
+            ServiceMapSpan serverSpan, Map<String, List<ServiceMapSpan>> childrenByParent) {
         Set<String> visited = new HashSet<>();
-        Deque<SpanData> pending = new ArrayDeque<>(
-            childrenByParent.getOrDefault(serverSpan.spanId, Collections.emptyList()));
+        Deque<ServiceMapSpan> pending = new ArrayDeque<>(
+            childrenByParent.getOrDefault(serverSpan.spanId(), Collections.emptyList()));
         while (!pending.isEmpty()) {
-            SpanData child = pending.removeFirst();
-            if (!visited.add(child.spanId) || !serverSpan.serviceName.equals(child.serviceName)) {
+            ServiceMapSpan child = pending.removeFirst();
+            if (!visited.add(child.spanId()) || !serverSpan.serviceName().equals(child.serviceName())) {
                 continue;
             }
-            if (CLIENT_KIND.equals(child.kind)) {
+            if (CLIENT_KIND.equals(child.kind())) {
                 return true;
             }
-            pending.addAll(childrenByParent.getOrDefault(child.spanId, Collections.emptyList()));
+            pending.addAll(childrenByParent.getOrDefault(child.spanId(), Collections.emptyList()));
         }
         return false;
     }
 
-    private static String findEntryOperation(SpanData span, Map<String, SpanData> spansById) {
-        SpanData current = span;
+    private static String findEntryOperation(ServiceMapSpan span, Map<String, ServiceMapSpan> spansById) {
+        ServiceMapSpan current = span;
         Set<String> visited = new HashSet<>();
-        while (current.parentSpanId != null && visited.add(current.spanId)) {
-            SpanData parent = spansById.get(current.parentSpanId);
-            if (parent == null || !Objects.equals(span.serviceName, parent.serviceName)) {
+        while (current.parentSpanId() != null && visited.add(current.spanId())) {
+            ServiceMapSpan parent = spansById.get(current.parentSpanId());
+            if (parent == null || !Objects.equals(span.serviceName(), parent.serviceName())) {
                 break;
             }
-            if (SERVER_KIND.equals(parent.kind) || CONSUMER_KIND.equals(parent.kind)) {
-                return parent.operationName;
+            if (SERVER_KIND.equals(parent.kind()) || CONSUMER_KIND.equals(parent.kind())) {
+                return parent.operationName();
             }
             current = parent;
         }
-        return span.operationName;
+        return span.operationName();
     }
 
-    private SpanData parseSpan(Map<String, Object> source) {
+    private ServiceMapSpan parseSpan(Map<String, Object> source) {
         String traceId = stringValue(source.get("traceId"));
         String spanId = stringValue(source.get("spanId"));
         if (traceId == null || spanId == null) {
@@ -510,7 +423,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
         }
 
-        return new SpanData(
+        return new ServiceMapSpan(
             traceId,
             spanId,
             stringValue(source.get("parentSpanId")),
@@ -524,16 +437,16 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     }
 
     private Collection<TraceTombstone> tombstones(
-            Map<String, Map<String, SpanData>> spansByTrace, Instant now) {
+            Map<String, Map<String, ServiceMapSpan>> spansByTrace, Instant now) {
         List<TraceTombstone> tombstones = new ArrayList<>(spansByTrace.size());
-        for (Map.Entry<String, Map<String, SpanData>> trace : spansByTrace.entrySet()) {
+        for (Map.Entry<String, Map<String, ServiceMapSpan>> trace : spansByTrace.entrySet()) {
             Instant lastIndexedAt = trace.getValue().values().stream()
-                .map(SpanData::indexedAt)
+                .map(span -> span.indexedAt())
                 .filter(Objects::nonNull)
                 .max(Instant::compareTo)
                 .orElse(now);
             boolean rootSeen = trace.getValue().values().stream()
-                .anyMatch(span -> span.parentSpanId == null);
+                .anyMatch(span -> span.parentSpanId() == null);
             tombstones.add(new TraceTombstone(
                 trace.getKey(),
                 lastIndexedAt,
@@ -641,20 +554,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return result;
     }
 
-    private static String sha256Hex(String input) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                .digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder result = new StringBuilder(digest.length * 2);
-            for (byte value : digest) {
-                result.append(String.format(Locale.ROOT, "%02x", value));
-            }
-            return result.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is unavailable", e);
-        }
-    }
-
     static String stateNamespace(
             String tracesIndex,
             String serviceMapIndex,
@@ -673,7 +572,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         for (String component : components) {
             canonical.append(component.length()).append(':').append(component);
         }
-        return sha256Hex(canonical.toString());
+        return ServiceMapHashing.sha256Hex(canonical.toString());
     }
 
     private CompletableFuture<SearchResponse> search(SearchRequest request) {
@@ -714,44 +613,4 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return future;
     }
 
-    private record SpanData(
-        String traceId,
-        String spanId,
-        String parentSpanId,
-        String serviceName,
-        String kind,
-        String operationName,
-        Instant endTime,
-        Instant indexedAt,
-        String environment,
-        Map<String, Object> groupByAttributes) {}
-
-    private record KeyAttributes(String environment, String name) {
-        @Override
-        public int hashCode() {
-            return Objects.hash(environment, name);
-        }
-    }
-
-    private record NodeIdentity(
-            String type, KeyAttributes keyAttributes, Map<String, Object> groupByAttributes) {
-        private NodeIdentity {
-            groupByAttributes = Map.copyOf(groupByAttributes);
-        }
-
-        private Map<String, Object> asMap() {
-            Map<String, Object> node = new LinkedHashMap<>();
-            node.put("type", type);
-            node.put("keyAttributes", Map.of(
-                "name", keyAttributes.name,
-                "environment", keyAttributes.environment));
-            node.put("groupByAttributes", groupByAttributes);
-            return node;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(type, keyAttributes, groupByAttributes);
-        }
-    }
 }

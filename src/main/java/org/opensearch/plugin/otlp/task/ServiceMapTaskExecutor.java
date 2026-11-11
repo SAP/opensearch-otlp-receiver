@@ -17,7 +17,7 @@ import org.opensearch.persistent.AllocatedPersistentTask;
 import org.opensearch.persistent.PersistentTaskState;
 import org.opensearch.persistent.PersistentTasksCustomMetadata.PersistentTask;
 import org.opensearch.persistent.PersistentTasksExecutor;
-import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapBuilder;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 

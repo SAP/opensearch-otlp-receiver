@@ -8,12 +8,13 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
-package org.opensearch.plugin.otlp.index;
+package org.opensearch.plugin.otlp.servicemap;
 
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Clock;

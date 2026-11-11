@@ -17,7 +17,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.persistent.PersistentTasksCustomMetadata;
-import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapBuilder;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
 import org.opensearch.search.SearchHit;
 

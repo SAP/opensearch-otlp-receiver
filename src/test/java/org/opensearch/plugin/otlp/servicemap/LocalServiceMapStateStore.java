@@ -8,7 +8,7 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
-package org.opensearch.plugin.otlp.index;
+package org.opensearch.plugin.otlp.servicemap;
 
 import java.time.Instant;
 import java.util.Collection;
