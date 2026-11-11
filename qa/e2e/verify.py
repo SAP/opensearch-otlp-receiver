@@ -9,6 +9,7 @@ import urllib.request
 
 EXPECTED_COUNTS = {
     "otel-v1-apm-span": 2,
+    "otel-v2-apm-service-map": 2,
     "metrics-otel-v1": 3,
     "logs-otel-v1": 2,
 }
@@ -54,7 +55,12 @@ def verify_plugin_and_templates(base_url):
         f"Plugin is not installed; found components: {sorted(components)}"
     )
 
-    for template in ("ss4o_traces", "ss4o_metrics", "ss4o_logs"):
+    for template in (
+        "ss4o_traces",
+        "ss4o_metrics",
+        "ss4o_logs",
+        "ss4o_service_map",
+    ):
         response = request_json(base_url, f"/_index_template/{template}")
         assert response.get("index_templates"), f"Template {template} is missing"
 
@@ -91,6 +97,37 @@ def verify_metrics(base_url):
     assert all("@timestamp" in document for document in documents)
 
 
+def node_name(document, field):
+    node = document[field]
+    assert node["type"] == "service"
+    assert node["keyAttributes"]["environment"] == "dev"
+    return node["keyAttributes"]["name"]
+
+
+def verify_service_map(base_url):
+    documents = sources(base_url, "otel-v2-apm-service-map")
+    edges = [document for document in documents if document.get("targetNode")]
+    leaves = [document for document in documents if not document.get("targetNode")]
+    assert len(edges) == 1, f"Expected one service-map edge, got {edges}"
+    assert len(leaves) == 1, f"Expected one service-map leaf, got {leaves}"
+
+    edge = edges[0]
+    assert node_name(edge, "sourceNode") == "frontend-service"
+    assert node_name(edge, "targetNode") == "backend-service"
+    assert edge["sourceOperation"]["name"] == "GET /api/orders"
+    assert edge["targetOperation"]["name"] == "query-orders"
+
+    leaf = leaves[0]
+    assert node_name(leaf, "sourceNode") == "backend-service"
+    assert leaf["sourceOperation"]["name"] == "query-orders"
+    assert leaf.get("targetOperation") is None
+
+    for document in documents:
+        assert document.get("timestamp")
+        assert document.get("nodeConnectionHash")
+        assert document.get("operationConnectionHash")
+
+
 def verify_logs(base_url):
     documents = sources(base_url, "logs-otel-v1")
     assert {document["body"] for document in documents} == {
@@ -111,6 +148,13 @@ def verify_mappings(base_url):
     properties = response["otel-v1-apm-span"]["mappings"]["properties"]
     assert properties["traceId"]["type"] == "keyword"
     assert properties["startTime"]["type"] == "date_nanos"
+    assert properties["indexedAt"]["type"] == "date_nanos"
+
+    response = request_json(base_url, "/otel-v2-apm-service-map/_mapping")
+    properties = response["otel-v2-apm-service-map"]["mappings"]["properties"]
+    assert properties["timestamp"]["type"] == "date"
+    assert properties["nodeConnectionHash"]["type"] == "keyword"
+    assert properties["operationConnectionHash"]["type"] == "keyword"
 
 
 def main():
@@ -121,6 +165,7 @@ def main():
     wait_for_documents(base_url)
     verify_plugin_and_templates(base_url)
     verify_spans(base_url)
+    verify_service_map(base_url)
     verify_metrics(base_url)
     verify_logs(base_url)
     verify_mappings(base_url)

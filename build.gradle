@@ -214,11 +214,6 @@ tasks.register('e2eTest', Exec) {
     dependsOn tasks.named('bundlePlugin')
     inputs.file(e2ePluginZip)
     inputs.files(fileTree('qa/e2e'))
-    inputs.files(
-        'samples/send-traces.sh',
-        'samples/send-metrics.sh',
-        'samples/send-logs.sh'
-    )
     outputs.upToDateWhen { false }
 
     commandLine 'bash', layout.projectDirectory.file('qa/e2e/run.sh').asFile.absolutePath

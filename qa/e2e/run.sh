@@ -3,9 +3,24 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPOSITORY_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 PROJECT_NAME="opensearch-otlp-e2e-$$"
+SETUP_LOG=""
+
+is_true() {
+  case "$1" in
+    1|true|TRUE|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+quiet_output() {
+  if [[ -n ${E2E_QUIET+x} ]]; then
+    is_true "${E2E_QUIET}"
+  else
+    is_true "${CI:-}" || [[ ! -t 1 ]]
+  fi
+}
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -24,10 +39,17 @@ cleanup() {
 
   if (( exit_code != 0 )); then
     echo "End-to-end test failed; container logs follow." >&2
+    if [[ -n "${SETUP_LOG}" && -s "${SETUP_LOG}" ]]; then
+      echo "Docker Compose startup output:" >&2
+      cat "${SETUP_LOG}" >&2
+    fi
     compose logs --no-color >&2 || true
   fi
 
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+  if [[ -n "${SETUP_LOG}" ]]; then
+    rm -f -- "${SETUP_LOG}"
+  fi
   exit "${exit_code}"
 }
 
@@ -60,7 +82,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "Starting the end-to-end test environment"
-compose up --detach --wait --wait-timeout 240
+if quiet_output; then
+  SETUP_LOG=$(mktemp "${TMPDIR:-/tmp}/opensearch-otlp-e2e.XXXXXX")
+  compose up --detach --wait --wait-timeout 240 >"${SETUP_LOG}" 2>&1
+else
+  compose up --detach --wait --wait-timeout 240
+fi
 
 OPENSEARCH_ADDRESS=$(compose port opensearch 9200)
 OTLP_HTTP_ADDRESS=$(compose port otelcol 4318)
@@ -72,11 +99,9 @@ OTLP_HTTP_URL="http://${OTLP_HTTP_ADDRESS}"
 wait_for_url "http://${COLLECTOR_HEALTH_ADDRESS}/" "OpenTelemetry Collector"
 
 echo "Sending trace, metric, and log fixtures"
-bash "${REPOSITORY_DIR}/samples/send-traces.sh" "${OTLP_HTTP_URL}"
-bash "${REPOSITORY_DIR}/samples/send-metrics.sh" "${OTLP_HTTP_URL}"
-bash "${REPOSITORY_DIR}/samples/send-logs.sh" "${OTLP_HTTP_URL}"
+python3 "${SCRIPT_DIR}/send.py" "${OTLP_HTTP_URL}"
 
-echo "Verifying indexed telemetry"
+echo "Verifying indexed telemetry and generated service map"
 python3 "${SCRIPT_DIR}/verify.py" "${OPENSEARCH_URL}"
 
 echo "End-to-end test passed"

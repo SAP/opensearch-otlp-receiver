@@ -47,14 +47,18 @@ The plugin zip is created at `build/distributions/opensearch-otlp-receiver-<vers
 
 With Docker and Docker Compose available, run the packaged plugin against a real
 OpenSearch node and ingest traces, metrics, and logs through an OpenTelemetry
-Collector:
+Collector. The test also waits for service-map correlation and verifies the
+generated edge and leaf observations:
 
 ```bash
 ./gradlew e2eTest
 ```
 
 The end-to-end test is intentionally separate from `check`, so regular builds do
-not require Docker.
+not require Docker. Docker Compose startup progress is shown in an interactive
+terminal and captured in CI or other non-interactive environments. Set
+`E2E_QUIET=true` or `E2E_QUIET=false` to override that detection; captured output
+is printed when a test fails.
 
 ### Install into OpenSearch
 

@@ -9,5 +9,6 @@ aux.transport.transport-grpc.port: 4317
 
 plugins.otlp.enabled: true
 plugins.otlp.index.create_templates: true
+plugins.otlp.service_map.interval: 1s
 
 logger.org.opensearch.plugin.otlp: INFO
