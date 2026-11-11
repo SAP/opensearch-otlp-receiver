@@ -62,6 +62,7 @@ public abstract class OTLPPluginITBase extends OpenSearchSingleNodeTestCase {
         return Settings.builder()
             .put(super.nodeSettings())
             .put("plugins.otlp.index.create_templates", true)
+            .put("plugins.otlp.service_map.enabled", false)
             .put("plugins.otlp.traces.index",  TRACES_INDEX)
             .put("plugins.otlp.logs.index",    LOGS_INDEX)
             .put("plugins.otlp.metrics.index", METRICS_INDEX)

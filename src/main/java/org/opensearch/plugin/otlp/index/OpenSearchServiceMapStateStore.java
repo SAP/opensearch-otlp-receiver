@@ -58,9 +58,9 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
     }
 
     @Override
-    public Cursor loadCursor(String prefix) throws Exception {
+    public Cursor loadCursor(Scope scope) throws Exception {
         ensureIndex();
-        GetResponse response = get(new GetRequest(INDEX, cursorId(prefix))).get();
+        GetResponse response = get(new GetRequest(INDEX, cursorId(scope))).get();
         if (!response.isExists()) {
             return null;
         }
@@ -72,13 +72,13 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
     }
 
     @Override
-    public Set<String> loadProcessedTraceIds(Collection<String> traceIds) throws Exception {
+    public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) throws Exception {
         ensureIndex();
         if (traceIds.isEmpty()) {
             return Set.of();
         }
         MultiGetRequest request = new MultiGetRequest();
-        traceIds.forEach(id -> request.add(INDEX, traceId(id)));
+        traceIds.forEach(id -> request.add(INDEX, traceId(scope, id)));
         MultiGetResponse response = multiGet(request).get();
         Set<String> processed = new HashSet<>();
         for (MultiGetItemResponse item : response) {
@@ -97,19 +97,19 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
     }
 
     @Override
-    public void commit(String prefix, Cursor cursor, Collection<TraceTombstone> tombstones) throws Exception {
+    public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) throws Exception {
         ensureIndex();
         BulkRequest bulk = new BulkRequest();
         for (TraceTombstone tombstone : tombstones) {
             Map<String, Object> source = new LinkedHashMap<>();
             source.put("type", "trace");
-            source.put("prefix", prefix);
+            source.put("prefix", scope.prefix());
             source.put("traceId", tombstone.traceId());
             source.put("lastProcessedIndexedAt", tombstone.lastProcessedIndexedAt().toString());
             source.put("generation", tombstone.generation());
             source.put("rootSeen", tombstone.rootSeen());
             source.put("expiresAt", tombstone.expiresAt().toString());
-            bulk.add(new IndexRequest(INDEX).id(traceId(tombstone.traceId()))
+            bulk.add(new IndexRequest(INDEX).id(traceId(scope, tombstone.traceId()))
                 .source(source, XContentType.JSON));
         }
         if (bulk.numberOfActions() > 0) {
@@ -119,9 +119,9 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
                     + response.buildFailureMessage());
             }
         }
-        IndexRequest cursorRequest = new IndexRequest(INDEX).id(cursorId(prefix)).source(Map.of(
+        IndexRequest cursorRequest = new IndexRequest(INDEX).id(cursorId(scope)).source(Map.of(
             "type", "cursor",
-            "prefix", prefix,
+            "prefix", scope.prefix(),
             "indexedAt", cursor.indexedAt().toString(),
             "documentId", cursor.documentId()), XContentType.JSON);
         index(cursorRequest).get();
@@ -205,12 +205,12 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
         initialized = true;
     }
 
-    private static String cursorId(String prefix) {
-        return "cursor:" + prefix;
+    private static String cursorId(Scope scope) {
+        return "cursor:" + scope.namespace() + ":" + scope.prefix();
     }
 
-    private static String traceId(String traceId) {
-        return "trace:" + traceId;
+    private static String traceId(Scope scope, String traceId) {
+        return "trace:" + scope.namespace() + ":" + traceId;
     }
 
     private static String stringValue(Object value) {

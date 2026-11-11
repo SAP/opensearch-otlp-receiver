@@ -161,6 +161,36 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertTrue(query, query.contains("\"value\" : \"a\""));
     }
 
+    public void testStateNamespaceTracksEffectiveConfiguration() {
+        List<String> groups = List.of("service.version", "k8s.cluster.name");
+        String base = ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5),
+            groups);
+        assertTrue(base, base.matches("[0-9a-f]{64}"));
+
+        assertEquals("grouping order is not semantically significant", base,
+            ServiceMapBuilder.stateNamespace(
+                "traces-a", "service-map-a",
+                TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5),
+                List.of("k8s.cluster.name", "service.version")));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-b", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-b",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(2), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(10), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), List.of()));
+    }
+
     public void testEnvironmentAndConfiguredGroupingAttributesAreEmitted() {
         Map<String, Object> serverSpan = span(
             "trace-env", "server", null, "payments", "SPAN_KIND_SERVER", "charge");

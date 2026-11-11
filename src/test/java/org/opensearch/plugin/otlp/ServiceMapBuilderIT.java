@@ -14,6 +14,7 @@ import com.google.protobuf.ByteString;
 import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.persistent.PersistentTasksCustomMetadata;
 import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
@@ -32,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
     private static final String SERVICE_MAP_INDEX = "otel-v2-apm-service-map-test";
+    private static final String SERVICE_MAP_STATE_INDEX = ".opensearch-otlp-service-map-state";
+    private static final String TRACE_ID_HEX = "0a0b0c0d0e0f10111213141516171819";
 
     private static final ByteString TRACE_ID = ByteString.copyFrom(
         new byte[]{ 10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25 });
@@ -39,6 +42,14 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         new byte[]{ 10,11,12,13,14,15,16,17 });
     private static final ByteString CHILD_SPAN_ID = ByteString.copyFrom(
         new byte[]{ 20,21,22,23,24,25,26,27 });
+
+    @Override
+    protected Settings nodeSettings() {
+        return Settings.builder()
+            .put(super.nodeSettings())
+            .put("plugins.otlp.service_map.enabled", true)
+            .build();
+    }
 
     // ── two-service trace produces one edge and one leaf observation ──────────
 
@@ -93,6 +104,19 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         }
         assertTrue("edge document present", hasEdge);
         assertTrue("leaf document present", hasLeaf);
+
+        refresh(SERVICE_MAP_STATE_INDEX);
+        Set<String> stateIds = new HashSet<>();
+        for (SearchHit hit : searchAll(SERVICE_MAP_STATE_INDEX).getHits().getHits()) {
+            stateIds.add(hit.getId());
+        }
+        assertTrue("cursor ID contains a configuration namespace", stateIds.stream()
+            .anyMatch(id -> id.matches("cursor:[0-9a-f]{64}:0")));
+        assertTrue("tombstone ID contains the same kind of namespace", stateIds.stream()
+            .anyMatch(id -> id.matches("trace:[0-9a-f]{64}:" + TRACE_ID_HEX)));
+        assertFalse("legacy unscoped cursor must not be reused", stateIds.contains("cursor:0"));
+        assertFalse("legacy unscoped tombstone must not be reused",
+            stateIds.contains("trace:" + TRACE_ID_HEX));
     }
 
     public void testPersistentTasksCoverAllTraceIdPrefixes() throws Exception {

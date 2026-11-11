@@ -55,6 +55,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.Cursor;
+import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.Scope;
 import static org.opensearch.plugin.otlp.index.ServiceMapStateStore.TraceTombstone;
 
 /** Builds OpenSearch APM v2 service-map observations from recently indexed spans. */
@@ -68,6 +69,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private static final String CLIENT_KIND = "SPAN_KIND_CLIENT";
     private static final String SERVER_KIND = "SPAN_KIND_SERVER";
     private static final String CONSUMER_KIND = "SPAN_KIND_CONSUMER";
+    private static final String ALGORITHM_VERSION = "service-map-generation-v1";
 
     private static final String[] SOURCE_FIELDS = {
         "traceId", "spanId", "parentSpanId", "serviceName", "kind", "name",
@@ -84,6 +86,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final String traceIdPrefix;
     private final Clock clock;
     private final ServiceMapStateStore stateStore;
+    private final String stateNamespace;
 
     private Scheduler.Cancellable scheduledTask;
     private final Cancellable cancellable = new Cancellable();
@@ -172,6 +175,8 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         this.traceIdPrefix = traceIdPrefix;
         this.clock = clock;
         this.stateStore = stateStore;
+        this.stateNamespace = stateNamespace(
+            tracesIndex, serviceMapIndex, interval, lookbackWindow, groupByAttributes);
     }
 
     @Override
@@ -214,8 +219,9 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     }
 
     private void processIncremental(Instant now) throws Exception {
-        String partition = traceIdPrefix == null ? "all" : traceIdPrefix;
-        Cursor cursor = stateStore.loadCursor(partition);
+        String prefix = traceIdPrefix == null ? "all" : traceIdPrefix;
+        Scope scope = new Scope(stateNamespace, prefix);
+        Cursor cursor = stateStore.loadCursor(scope);
         Instant lowerBound = cursor == null
             ? now.minusMillis(lookbackWindow.millis())
             : cursor.indexedAt().minusMillis(Math.min(CURSOR_OVERLAP.millis(), lookbackWindow.millis()));
@@ -256,7 +262,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 }
             }
             Map<String, Map<String, SpanData>> spansByTrace = loadTraces(traceIds);
-            Set<String> previouslyProcessed = stateStore.loadProcessedTraceIds(traceIds);
+            Set<String> previouslyProcessed = stateStore.loadProcessedTraceIds(scope, traceIds);
             reconcile(spansByTrace, previouslyProcessed);
 
             SearchHit last = hits[hits.length - 1];
@@ -265,14 +271,14 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 throw new IllegalStateException("Discovered span has no indexedAt value");
             }
             cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
-            stateStore.commit(partition, cursor, tombstones(spansByTrace, now));
+            stateStore.commit(scope, cursor, tombstones(spansByTrace, now));
 
             searchAfter = hits[hits.length - 1].getSortValues();
             if (hits.length < PAGE_SIZE) {
                 break;
             }
         } while (true);
-        stateStore.deleteExpired(partition, now);
+        stateStore.deleteExpired(prefix, now);
     }
 
     private static Cursor maxCursor(Cursor current, Cursor candidate) {
@@ -676,6 +682,27 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         }
     }
 
+    static String stateNamespace(
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes) {
+        List<String> components = new ArrayList<>();
+        components.add(ALGORITHM_VERSION);
+        components.add(tracesIndex);
+        components.add(serviceMapIndex);
+        components.add(Long.toString(interval.millis()));
+        components.add(Long.toString(lookbackWindow.millis()));
+        groupByAttributes.stream().distinct().sorted().forEach(components::add);
+
+        StringBuilder canonical = new StringBuilder();
+        for (String component : components) {
+            canonical.append(component.length()).append(':').append(component);
+        }
+        return sha256Hex(canonical.toString());
+    }
+
     private CompletableFuture<SearchResponse> search(SearchRequest request) {
         if (cancellable.isCancelled()) {
             return CompletableFuture.failedFuture(new Cancellable.CancelledException());
@@ -727,29 +754,40 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         Map<String, Object> groupByAttributes) {}
 
     private static final class LocalStateStore implements ServiceMapStateStore {
-        private final Map<String, Cursor> cursors = new HashMap<>();
+        private final Map<Scope, Cursor> cursors = new HashMap<>();
         private final Set<String> processedTraceIds = new HashSet<>();
 
         @Override
-        public Cursor loadCursor(String prefix) {
-            return cursors.get(prefix);
+        public Cursor loadCursor(Scope scope) {
+            return cursors.get(scope);
         }
 
         @Override
-        public Set<String> loadProcessedTraceIds(Collection<String> traceIds) {
-            Set<String> result = new HashSet<>(traceIds);
-            result.retainAll(processedTraceIds);
+        public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) {
+            Set<String> result = new HashSet<>();
+            for (String traceId : traceIds) {
+                if (processedTraceIds.contains(processedTraceId(scope, traceId))) {
+                    result.add(traceId);
+                }
+            }
             return result;
         }
 
         @Override
-        public void commit(String prefix, Cursor cursor, Collection<TraceTombstone> tombstones) {
-            cursors.put(prefix, cursor);
-            tombstones.stream().map(TraceTombstone::traceId).forEach(processedTraceIds::add);
+        public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) {
+            cursors.put(scope, cursor);
+            tombstones.stream()
+                .map(TraceTombstone::traceId)
+                .map(traceId -> processedTraceId(scope, traceId))
+                .forEach(processedTraceIds::add);
         }
 
         @Override
         public void deleteExpired(String prefix, Instant now) {}
+
+        private static String processedTraceId(Scope scope, String traceId) {
+            return scope.namespace() + "\u0000" + traceId;
+        }
     }
 
     private record KeyAttributes(String environment, String name) {

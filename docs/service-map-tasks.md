@@ -31,6 +31,12 @@ upserts corrected edges and deterministically deletes a leaf that is no longer a
 leaf, without storing emitted document IDs. A per-task guard prevents overlapping
 runs.
 
+Cursor and tombstone IDs contain a namespace derived from the service-map algorithm
+version, trace and service-map indices, interval, lookback, and grouping attributes.
+Changing any effective configuration therefore starts from a fresh cursor and cannot
+reuse incompatible state. Expired tombstones from older namespaces are still cleaned
+by the task owning their trace-ID prefix.
+
 Disabling service-map creation removes the persistent tasks. Changes to task
 configuration replace them sequentially with updated parameters.
 

@@ -17,13 +17,15 @@ import java.util.Set;
 /** Durable, small coordination state for an incremental service-map partition. */
 interface ServiceMapStateStore {
 
-    Cursor loadCursor(String prefix) throws Exception;
+    Cursor loadCursor(Scope scope) throws Exception;
 
-    Set<String> loadProcessedTraceIds(Collection<String> traceIds) throws Exception;
+    Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) throws Exception;
 
-    void commit(String prefix, Cursor cursor, Collection<TraceTombstone> tombstones) throws Exception;
+    void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) throws Exception;
 
     void deleteExpired(String prefix, Instant now) throws Exception;
+
+    record Scope(String namespace, String prefix) {}
 
     record Cursor(Instant indexedAt, String documentId) {}
 
