@@ -20,9 +20,11 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("unchecked")
@@ -279,6 +281,72 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             ((Map<String, Object>) corrected.sourceAsMap().get("sourceOperation")).get("name"));
     }
 
+    public void testSuccessfulRunRecordsWorkloadAndLag() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-metrics", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-metrics", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = stub(spans);
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+
+        builder(client, FIRST_TICK, List.of(), null, metrics).run();
+
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.RUNS).total, 0.0);
+        assertEquals("success",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.TRACES_PROCESSED).total, 0.0);
+        assertEquals(2.0, registry.counter(ServiceMapMetrics.SPANS_PROCESSED).total, 0.0);
+        assertEquals(10.0,
+            registry.histogram(ServiceMapMetrics.PROCESSING_LAG).samples.get(0).value(), 0.0);
+        assertEquals(1, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.size());
+    }
+
+    public void testFailedRunRecordsOutcomeAndPhase() {
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+        ServiceMapStateStore failingStateStore = new ServiceMapStateStore() {
+            @Override
+            public Cursor loadCursor(Scope scope) {
+                throw new IllegalStateException("state unavailable");
+            }
+
+            @Override
+            public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) {
+                return Set.of();
+            }
+
+            @Override
+            public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) {}
+
+            @Override
+            public void deleteExpired(String prefix, Instant now) {}
+        };
+        ServiceMapBuilder builder = new ServiceMapBuilder(
+            stub(List.of()),
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(FIRST_TICK, ZoneOffset.UTC),
+            failingStateStore,
+            metrics);
+
+        builder.run();
+
+        assertEquals("failure",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals("state_load",
+            registry.counter(ServiceMapMetrics.FAILURES).samples.get(0).tags().get("phase"));
+        assertEquals(1, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.size());
+    }
+
     private static TraceGroupEnricherTests.StubClient stub(List<Map<String, Object>> spans) {
         return new TraceGroupEnricherTests.StubClient(List.of(spans, spans));
     }
@@ -293,6 +361,15 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             Instant time,
             List<String> groupByAttributes,
             String traceIdPrefix) {
+        return builder(client, time, groupByAttributes, traceIdPrefix, new ServiceMapMetrics());
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            ServiceMapMetrics metrics) {
         return new ServiceMapBuilder(
             client,
             null,
@@ -303,7 +380,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             groupByAttributes,
             traceIdPrefix,
             Clock.fixed(time, ZoneOffset.UTC),
-            new LocalServiceMapStateStore());
+            new LocalServiceMapStateStore(),
+            metrics);
     }
 
     private static Map<String, Object> span(

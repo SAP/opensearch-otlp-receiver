@@ -34,6 +34,7 @@ import org.opensearch.transport.client.Client;
 
 import java.time.Clock;
 import java.time.DateTimeException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -53,6 +54,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Cursor;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Scope;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.TraceTombstone;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.CLEANUP;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.DISCOVERY;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.SERVICE_MAP_WRITE;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_COMMIT;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_LOAD;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.TRACE_LOAD;
 
 /** Builds OpenSearch APM v2 service-map observations from recently indexed spans. */
 public class ServiceMapBuilder extends AbstractLifecycleComponent {
@@ -85,6 +92,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final ServiceMapStateStore stateStore;
     private final ServiceMapDocumentFactory documentFactory;
     private final String stateNamespace;
+    private final ServiceMapMetrics metrics;
 
     private Scheduler.Cancellable scheduledTask;
     private final Cancellable cancellable = new Cancellable();
@@ -122,7 +130,21 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             List<String> groupByAttributes,
             String traceIdPrefix) {
         this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, traceIdPrefix, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client));
+            groupByAttributes, traceIdPrefix, new ServiceMapMetrics());
+    }
+
+    public ServiceMapBuilder(
+            Client client,
+            ThreadPool threadPool,
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            ServiceMapMetrics metrics) {
+        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
+            groupByAttributes, traceIdPrefix, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client), metrics);
     }
 
     ServiceMapBuilder(
@@ -136,6 +158,22 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             String traceIdPrefix,
             Clock clock,
             ServiceMapStateStore stateStore) {
+        this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
+            groupByAttributes, traceIdPrefix, clock, stateStore, new ServiceMapMetrics());
+    }
+
+    ServiceMapBuilder(
+            Client client,
+            ThreadPool threadPool,
+            String tracesIndex,
+            String serviceMapIndex,
+            TimeValue interval,
+            TimeValue lookbackWindow,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            Clock clock,
+            ServiceMapStateStore stateStore,
+            ServiceMapMetrics metrics) {
         this.client = client;
         this.threadPool = threadPool;
         this.tracesIndex = tracesIndex;
@@ -146,6 +184,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         this.traceIdPrefix = traceIdPrefix;
         this.clock = clock;
         this.stateStore = stateStore;
+        this.metrics = Objects.requireNonNull(metrics);
         this.documentFactory = new ServiceMapDocumentFactory(interval.millis());
         this.stateNamespace = stateNamespace(
             tracesIndex, serviceMapIndex, interval, lookbackWindow, groupByAttributes);
@@ -171,34 +210,55 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     protected void doClose() {}
 
     public void run() {
-        if (cancellable.isCancelled() || !runInProgress.compareAndSet(false, true)) {
+        if (cancellable.isCancelled()) {
             return;
         }
+        if (!runInProgress.compareAndSet(false, true)) {
+            metrics.recordSkippedRun();
+            return;
+        }
+        long startNanos = System.nanoTime();
+        ServiceMapMetrics.RunOutcome outcome = ServiceMapMetrics.RunOutcome.SUCCESS;
         try {
             Instant now = clock.instant();
             LOG.debug("ServiceMapBuilder: discovering new spans in [{}*] for trace prefix [{}]",
                 tracesIndex, traceIdPrefix);
-            processIncremental(now);
+            RunStats stats = processIncremental(now);
+            if (stats.newestIndexedAt() != null) {
+                metrics.recordProcessed(
+                    stats.traceCount(),
+                    stats.spanCount(),
+                    Math.max(0.0, Duration.between(stats.newestIndexedAt(), now).toMillis() / 1_000.0));
+            }
         } catch (Exception e) {
             if (cancellable.isCancelled()) {
+                outcome = ServiceMapMetrics.RunOutcome.CANCELLED;
                 LOG.debug("ServiceMapBuilder tick interrupted by shutdown", e);
             } else {
+                outcome = ServiceMapMetrics.RunOutcome.FAILURE;
                 LOG.warn("ServiceMapBuilder tick failed", e);
             }
         } finally {
-            runInProgress.set(false);
+            try {
+                metrics.recordRun((System.nanoTime() - startNanos) / 1_000_000_000.0, outcome);
+            } finally {
+                runInProgress.set(false);
+            }
         }
     }
 
-    private void processIncremental(Instant now) throws Exception {
+    private RunStats processIncremental(Instant now) throws Exception {
         String prefix = traceIdPrefix == null ? "all" : traceIdPrefix;
         Scope scope = new Scope(stateNamespace, prefix);
-        Cursor cursor = stateStore.loadCursor(scope);
+        Cursor cursor = executePhase(STATE_LOAD, () -> stateStore.loadCursor(scope));
         Instant lowerBound = cursor == null
             ? now.minusMillis(lookbackWindow.millis())
             : cursor.indexedAt().minusMillis(Math.min(CURSOR_OVERLAP.millis(), lookbackWindow.millis()));
         Instant upperBound = now.minusMillis(DISCOVERY_DELAY.millis());
         Object[] searchAfter = null;
+        long traceCount = 0;
+        long spanCount = 0;
+        Instant newestIndexedAt = null;
 
         do {
             QueryBuilder query = QueryBuilders.rangeQuery("indexedAt")
@@ -220,7 +280,9 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 source.searchAfter(searchAfter);
             }
 
-            SearchResponse response = search(new SearchRequest(tracesIndex + "*").source(source)).get();
+            SearchResponse response = executePhase(
+                DISCOVERY,
+                () -> search(new SearchRequest(tracesIndex + "*").source(source)).get());
             SearchHit[] hits = response.getHits().getHits();
             if (hits.length == 0) {
                 break;
@@ -233,24 +295,37 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                     traceIds.add(traceId);
                 }
             }
-            Map<String, Map<String, ServiceMapSpan>> spansByTrace = loadTraces(traceIds);
-            Set<String> previouslyProcessed = stateStore.loadProcessedTraceIds(scope, traceIds);
-            reconcile(spansByTrace, previouslyProcessed);
-
             SearchHit last = hits[hits.length - 1];
             Instant lastIndexedAt = parseInstant(last.getSourceAsMap().get("indexedAt"));
             if (lastIndexedAt == null) {
+                metrics.recordFailure(DISCOVERY);
                 throw new IllegalStateException("Discovered span has no indexedAt value");
             }
+            Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
+                TRACE_LOAD, () -> loadTraces(traceIds));
+            Set<String> previouslyProcessed = executePhase(
+                STATE_LOAD,
+                () -> stateStore.loadProcessedTraceIds(scope, traceIds));
+            executePhase(SERVICE_MAP_WRITE, () -> reconcile(spansByTrace, previouslyProcessed));
+
             cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
-            stateStore.commit(scope, cursor, tombstones(spansByTrace, now));
+            Cursor committedCursor = cursor;
+            executePhase(
+                STATE_COMMIT,
+                () -> stateStore.commit(scope, committedCursor, tombstones(spansByTrace, now)));
+            traceCount += spansByTrace.size();
+            spanCount += spansByTrace.values().stream().mapToLong(Map::size).sum();
+            if (newestIndexedAt == null || lastIndexedAt.isAfter(newestIndexedAt)) {
+                newestIndexedAt = lastIndexedAt;
+            }
 
             searchAfter = hits[hits.length - 1].getSortValues();
             if (hits.length < PAGE_SIZE) {
                 break;
             }
         } while (true);
-        stateStore.deleteExpired(prefix, now);
+        executePhase(CLEANUP, () -> stateStore.deleteExpired(prefix, now));
+        return new RunStats(traceCount, spanCount, newestIndexedAt);
     }
 
     private static Cursor maxCursor(Cursor current, Cursor candidate) {
@@ -513,6 +588,26 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return ServiceMapHashing.sha256Hex(canonical.toString());
     }
 
+    private <T> T executePhase(
+            ServiceMapMetrics.ExecutionPhase phase, CheckedSupplier<T> operation) throws Exception {
+        try {
+            return operation.get();
+        } catch (Exception e) {
+            if (!cancellable.isCancelled()) {
+                metrics.recordFailure(phase);
+            }
+            throw e;
+        }
+    }
+
+    private void executePhase(
+            ServiceMapMetrics.ExecutionPhase phase, CheckedRunnable operation) throws Exception {
+        executePhase(phase, () -> {
+            operation.run();
+            return null;
+        });
+    }
+
     private CompletableFuture<SearchResponse> search(SearchRequest request) {
         if (cancellable.isCancelled()) {
             return CompletableFuture.failedFuture(new Cancellable.CancelledException());
@@ -549,6 +644,18 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
         });
         return future;
+    }
+
+    private record RunStats(long traceCount, long spanCount, Instant newestIndexedAt) {}
+
+    @FunctionalInterface
+    private interface CheckedSupplier<T> {
+        T get() throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface CheckedRunnable {
+        void run() throws Exception;
     }
 
 }

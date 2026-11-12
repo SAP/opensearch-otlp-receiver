@@ -40,6 +40,39 @@ by the task owning their trace-ID prefix.
 Disabling service-map creation removes the persistent tasks. Changes to task
 configuration replace them sequentially with updated parameters.
 
+## Observability
+
+Service-map tasks publish metrics through the OpenSearch telemetry framework on
+the node currently executing each task. Cluster-wide monitoring must aggregate
+these metrics across nodes because persistent tasks can move after a failure.
+
+| Metric | Type | Description |
+|---|---|---|
+| `otlp.service_map.run.duration` | Histogram | Run duration in seconds, tagged by `outcome` |
+| `otlp.service_map.runs` | Counter | Runs, tagged by `outcome` |
+| `otlp.service_map.traces.processed` | Counter | Traces evaluated by successful runs |
+| `otlp.service_map.spans.processed` | Counter | Spans evaluated by successful runs |
+| `otlp.service_map.span.processing_lag` | Histogram | Seconds between the newest discovered span's `indexedAt` timestamp and the start of its successful run |
+| `otlp.service_map.failures` | Counter | Failures, tagged by `phase` |
+| `otlp.service_map.runs.skipped` | Counter | Runs skipped because another run for the same task is active |
+
+The `outcome` values are `success`, `failure`, and `cancelled`. Processing lag is
+recorded only when a successful run discovers spans. Trace and span counters measure
+evaluation work rather than unique documents: cursor overlap, retries, and late spans
+can cause a trace to be evaluated more than once. Service-map document writes and
+deletes are intentionally left to the native metrics of the service-map index.
+
+Failures identify the execution phase in which the run stopped:
+
+| Phase | Work |
+|---|---|
+| `state_load` | Load the durable cursor and existing trace tombstones |
+| `discovery` | Find newly indexed spans for the task's trace-ID prefix |
+| `trace_load` | Load the complete affected traces and parse their spans |
+| `service_map_write` | Reconcile and write service-map edges and leaves |
+| `state_commit` | Persist the updated cursor and trace tombstones |
+| `cleanup` | Delete expired trace tombstones |
+
 ## Current limits
 
 - The partition count is fixed at 16.

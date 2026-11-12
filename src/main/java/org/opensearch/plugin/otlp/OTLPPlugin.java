@@ -25,6 +25,7 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.plugin.otlp.server.OTLPGrpcServiceFactory;
 import org.opensearch.plugin.otlp.index.IndexTemplateManager;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricher;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics;
 import org.opensearch.plugin.otlp.task.ServiceMapGenerationConfig;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskCoordinator;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskExecutor;
@@ -55,6 +56,7 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin, Persiste
     private static final Logger LOG = LogManager.getLogger(OTLPPlugin.class);
 
     private final Settings settings;
+    private final ServiceMapMetrics serviceMapMetrics = new ServiceMapMetrics();
 
     public OTLPPlugin(Settings settings) {
         this.settings = settings;
@@ -91,6 +93,9 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin, Persiste
         boolean pluginEnabled = OTLPPluginSettings.ENABLED.get(settings);
         boolean serviceMapEnabled = pluginEnabled
             && OTLPPluginSettings.SERVICE_MAP_ENABLED.get(settings);
+        if (serviceMapEnabled) {
+            serviceMapMetrics.initialize(metricsRegistry);
+        }
         ServiceMapGenerationConfig serviceMapConfig = new ServiceMapGenerationConfig(
             OTLPPluginSettings.TRACES_INDEX.get(settings),
             OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
@@ -143,7 +148,7 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin, Persiste
             Client client,
             SettingsModule settingsModule,
             IndexNameExpressionResolver expressionResolver) {
-        return List.of(new ServiceMapTaskExecutor(client, threadPool));
+        return List.of(new ServiceMapTaskExecutor(client, threadPool, serviceMapMetrics));
     }
 
     @Override

@@ -161,6 +161,9 @@ The plugin emits the following metrics via OpenSearch's telemetry framework:
 | `otlp.rejected_requests` | Counter | Number of requests rejected because `max_inflight_requests` was reached |
 | `otlp.inflight_requests` | UpDownCounter | Current number of bulk index requests in flight |
 
+Service-map generation provides additional workload, latency, and failure metrics.
+See [distributed service-map creation](docs/service-map-tasks.md#observability).
+
 Metrics require the `telemetry-otel` plugin (included with OpenSearch) and two settings in `opensearch.yml` (node-scoped; requires restart):
 
 ```yaml

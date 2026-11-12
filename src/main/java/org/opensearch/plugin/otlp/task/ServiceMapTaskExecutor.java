@@ -18,6 +18,7 @@ import org.opensearch.persistent.PersistentTaskState;
 import org.opensearch.persistent.PersistentTasksCustomMetadata.PersistentTask;
 import org.opensearch.persistent.PersistentTasksExecutor;
 import org.opensearch.plugin.otlp.servicemap.ServiceMapBuilder;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
@@ -28,11 +29,17 @@ public final class ServiceMapTaskExecutor extends PersistentTasksExecutor<Servic
 
     private final Client client;
     private final ThreadPool threadPool;
+    private final ServiceMapMetrics metrics;
 
     public ServiceMapTaskExecutor(Client client, ThreadPool threadPool) {
+        this(client, threadPool, new ServiceMapMetrics());
+    }
+
+    public ServiceMapTaskExecutor(Client client, ThreadPool threadPool, ServiceMapMetrics metrics) {
         super(ServiceMapTaskParams.NAME, ThreadPool.Names.GENERIC);
         this.client = client;
         this.threadPool = threadPool;
+        this.metrics = metrics;
     }
 
     @Override
@@ -65,7 +72,8 @@ public final class ServiceMapTaskExecutor extends PersistentTasksExecutor<Servic
             TimeValue.timeValueMillis(config.intervalMillis()),
             TimeValue.timeValueMillis(config.lookbackMillis()),
             config.groupByAttributes(),
-            params.traceIdPrefix());
+            params.traceIdPrefix(),
+            metrics);
         if (((ServiceMapAllocatedTask) task).start(builder)) {
             threadPool.executor(ThreadPool.Names.GENERIC).execute(builder::run);
         }
