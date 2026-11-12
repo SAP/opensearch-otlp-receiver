@@ -21,7 +21,6 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.plugin.otlp.common.Cancellable;
@@ -48,7 +47,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Cursor;
@@ -80,7 +78,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         "startTime", "endTime", "indexedAt", "attributes", "resource.attributes"
     };
 
-    private final Client client;
+    private final ServiceMapClient serviceMapClient;
     private final ThreadPool threadPool;
     private final String tracesIndex;
     private final String serviceMapIndex;
@@ -117,7 +115,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             TimeValue lookbackWindow,
             List<String> groupByAttributes) {
         this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, null, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client));
+            groupByAttributes, null, Clock.systemUTC(), null);
     }
 
     public ServiceMapBuilder(
@@ -144,7 +142,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             String traceIdPrefix,
             ServiceMapMetrics metrics) {
         this(client, threadPool, tracesIndex, serviceMapIndex, interval, lookbackWindow,
-            groupByAttributes, traceIdPrefix, Clock.systemUTC(), new OpenSearchServiceMapStateStore(client), metrics);
+            groupByAttributes, traceIdPrefix, Clock.systemUTC(), null, metrics);
     }
 
     ServiceMapBuilder(
@@ -174,7 +172,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             Clock clock,
             ServiceMapStateStore stateStore,
             ServiceMapMetrics metrics) {
-        this.client = client;
+        this.serviceMapClient = new ServiceMapClient(client, cancellable::isCancelled);
         this.threadPool = threadPool;
         this.tracesIndex = tracesIndex;
         this.serviceMapIndex = serviceMapIndex;
@@ -183,7 +181,8 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         this.groupByAttributes = List.copyOf(groupByAttributes);
         this.traceIdPrefix = traceIdPrefix;
         this.clock = clock;
-        this.stateStore = stateStore;
+        this.stateStore = stateStore != null
+            ? stateStore : new OpenSearchServiceMapStateStore(serviceMapClient);
         this.metrics = Objects.requireNonNull(metrics);
         this.documentFactory = new ServiceMapDocumentFactory(interval.millis());
         this.stateNamespace = stateNamespace(
@@ -282,7 +281,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
             SearchResponse response = executePhase(
                 DISCOVERY,
-                () -> search(new SearchRequest(tracesIndex + "*").source(source)).get());
+                () -> serviceMapClient.search(new SearchRequest(tracesIndex + "*").source(source)).get());
             SearchHit[] hits = response.getHits().getHits();
             if (hits.length == 0) {
                 break;
@@ -356,7 +355,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
             }
-            SearchHit[] hits = search(new SearchRequest(tracesIndex + "*").source(source))
+            SearchHit[] hits = serviceMapClient.search(new SearchRequest(tracesIndex + "*").source(source))
                 .get().getHits().getHits();
             for (SearchHit hit : hits) {
                 ServiceMapSpan span = parseSpan(hit.getSourceAsMap());
@@ -427,7 +426,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         for (String id : deletesById) {
             bulk.add(new DeleteRequest(serviceMapIndex, id));
         }
-        BulkResponse response = bulkIndex(bulk).get();
+        BulkResponse response = serviceMapClient.bulk(bulk).get();
         if (response.hasFailures()) {
             throw new IllegalStateException("Failed to index service-map observations: "
                 + response.buildFailureMessage());
@@ -606,44 +605,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             operation.run();
             return null;
         });
-    }
-
-    private CompletableFuture<SearchResponse> search(SearchRequest request) {
-        if (cancellable.isCancelled()) {
-            return CompletableFuture.failedFuture(new Cancellable.CancelledException());
-        }
-        CompletableFuture<SearchResponse> future = new CompletableFuture<>();
-        client.search(request, new ActionListener<>() {
-            @Override
-            public void onResponse(SearchResponse response) {
-                future.complete(response);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                future.completeExceptionally(e);
-            }
-        });
-        return future;
-    }
-
-    private CompletableFuture<BulkResponse> bulkIndex(BulkRequest request) {
-        if (cancellable.isCancelled()) {
-            return CompletableFuture.failedFuture(new Cancellable.CancelledException());
-        }
-        CompletableFuture<BulkResponse> future = new CompletableFuture<>();
-        client.bulk(request, new ActionListener<>() {
-            @Override
-            public void onResponse(BulkResponse response) {
-                future.complete(response);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                future.completeExceptionally(e);
-            }
-        });
-        return future;
     }
 
     private record RunStats(long traceCount, long spanCount, Instant newestIndexedAt) {}

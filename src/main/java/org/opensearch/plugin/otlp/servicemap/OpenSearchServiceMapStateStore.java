@@ -24,12 +24,9 @@ import org.opensearch.action.get.MultiGetItemResponse;
 import org.opensearch.action.get.MultiGetRequest;
 import org.opensearch.action.get.MultiGetResponse;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.SearchRequest;
-import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentType;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -42,7 +39,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
 /** Stores cursors and expiring trace tombstones in a hidden OpenSearch index. */
 final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
@@ -50,17 +47,21 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
     static final String INDEX = ".opensearch-otlp-service-map-state";
     private static final int CLEANUP_PAGE_SIZE = 1_000;
 
-    private final Client client;
+    private final ServiceMapClient client;
     private volatile boolean initialized;
 
     OpenSearchServiceMapStateStore(Client client) {
+        this(new ServiceMapClient(client));
+    }
+
+    OpenSearchServiceMapStateStore(ServiceMapClient client) {
         this.client = client;
     }
 
     @Override
     public Cursor loadCursor(Scope scope) throws Exception {
         ensureIndex();
-        GetResponse response = get(new GetRequest(INDEX, cursorId(scope))).get();
+        GetResponse response = client.get(new GetRequest(INDEX, cursorId(scope))).get();
         if (!response.isExists()) {
             return null;
         }
@@ -79,7 +80,7 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
         }
         MultiGetRequest request = new MultiGetRequest();
         traceIds.forEach(id -> request.add(INDEX, traceId(scope, id)));
-        MultiGetResponse response = multiGet(request).get();
+        MultiGetResponse response = client.multiGet(request).get();
         Set<String> processed = new HashSet<>();
         for (MultiGetItemResponse item : response) {
             if (item.isFailed()) {
@@ -113,7 +114,7 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
                 .source(source, XContentType.JSON));
         }
         if (bulk.numberOfActions() > 0) {
-            BulkResponse response = bulk(bulk).get();
+            BulkResponse response = client.bulk(bulk).get();
             if (response.hasFailures()) {
                 throw new IllegalStateException("Failed to save service-map tombstones: "
                     + response.buildFailureMessage());
@@ -124,7 +125,7 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
             "prefix", scope.prefix(),
             "indexedAt", cursor.indexedAt().toString(),
             "documentId", cursor.documentId()), XContentType.JSON);
-        index(cursorRequest).get();
+        client.index(cursorRequest).get();
     }
 
     @Override
@@ -143,7 +144,7 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
             }
-            SearchHit[] hits = search(new SearchRequest(INDEX).source(source))
+            SearchHit[] hits = client.search(new SearchRequest(INDEX).source(source))
                 .get().getHits().getHits();
             if (hits.length == 0) {
                 return;
@@ -152,7 +153,7 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
             for (SearchHit hit : hits) {
                 bulk.add(new DeleteRequest(INDEX, hit.getId()));
             }
-            BulkResponse bulkResponse = bulk(bulk).get();
+            BulkResponse bulkResponse = client.bulk(bulk).get();
             if (bulkResponse.hasFailures()) {
                 throw new IllegalStateException("Failed to delete expired service-map state: "
                     + bulkResponse.buildFailureMessage());
@@ -185,18 +186,14 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
                     "generation", Map.of("type", "long"),
                     "rootSeen", Map.of("type", "boolean"),
                     "expiresAt", Map.of("type", "date_nanos"))));
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        client.admin().indices().create(request, ActionListener.wrap(
-            ignored -> future.complete(null),
-            failure -> {
-                if (ExceptionsHelper.unwrapCause(failure) instanceof ResourceAlreadyExistsException) {
-                    future.complete(null);
-                } else {
-                    future.completeExceptionally(failure);
-                }
-            }));
-        future.get();
-        ClusterHealthResponse health = health(new ClusterHealthRequest(INDEX)
+        try {
+            client.createIndex(request).get();
+        } catch (ExecutionException e) {
+            if (!(ExceptionsHelper.unwrapCause(e.getCause()) instanceof ResourceAlreadyExistsException)) {
+                throw e;
+            }
+        }
+        ClusterHealthResponse health = client.health(new ClusterHealthRequest(INDEX)
             .waitForYellowStatus()
             .waitForActiveShards(1)).get();
         if (health.isTimedOut()) {
@@ -217,40 +214,4 @@ final class OpenSearchServiceMapStateStore implements ServiceMapStateStore {
         return value instanceof String string && !string.isBlank() ? string : null;
     }
 
-    private CompletableFuture<GetResponse> get(GetRequest request) {
-        CompletableFuture<GetResponse> future = new CompletableFuture<>();
-        client.get(request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
-
-    private CompletableFuture<SearchResponse> search(SearchRequest request) {
-        CompletableFuture<SearchResponse> future = new CompletableFuture<>();
-        client.search(request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
-
-    private CompletableFuture<MultiGetResponse> multiGet(MultiGetRequest request) {
-        CompletableFuture<MultiGetResponse> future = new CompletableFuture<>();
-        client.multiGet(request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
-
-    private CompletableFuture<BulkResponse> bulk(BulkRequest request) {
-        CompletableFuture<BulkResponse> future = new CompletableFuture<>();
-        client.bulk(request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
-
-    private CompletableFuture<IndexResponse> index(IndexRequest request) {
-        CompletableFuture<IndexResponse> future = new CompletableFuture<>();
-        client.index(request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
-
-    private CompletableFuture<ClusterHealthResponse> health(ClusterHealthRequest request) {
-        CompletableFuture<ClusterHealthResponse> future = new CompletableFuture<>();
-        client.admin().cluster().health(
-            request, ActionListener.wrap(future::complete, future::completeExceptionally));
-        return future;
-    }
 }
