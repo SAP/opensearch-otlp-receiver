@@ -44,7 +44,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -62,11 +61,12 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private static final int PAGE_SIZE = 10_000;
     private static final TimeValue DISCOVERY_DELAY = TimeValue.timeValueSeconds(2);
     private static final TimeValue CURSOR_OVERLAP = TimeValue.timeValueSeconds(10);
-    private static final String DEFAULT_ENVIRONMENT = "generic:default";
     private static final String CLIENT_KIND = "SPAN_KIND_CLIENT";
     private static final String SERVER_KIND = "SPAN_KIND_SERVER";
     private static final String CONSUMER_KIND = "SPAN_KIND_CONSUMER";
     private static final String ALGORITHM_VERSION = "service-map-generation-v1";
+    private static final ServiceEnvironmentResolver ENVIRONMENT_RESOLVER =
+        new ServiceEnvironmentResolver();
 
     private static final String[] SOURCE_FIELDS = {
         "traceId", "spanId", "parentSpanId", "serviceName", "kind", "name",
@@ -432,7 +432,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             stringValue(source.get("name")),
             parseInstant(source.get("endTime")),
             parseInstant(source.get("indexedAt")),
-            deriveEnvironment(spanAttributes, resourceAttributes),
+            ENVIRONMENT_RESOLVER.resolve(spanAttributes, resourceAttributes),
             groups);
     }
 
@@ -459,68 +459,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static boolean isGroupValue(Object value) {
         return value instanceof String || value instanceof Number || value instanceof Boolean;
-    }
-
-    private static String deriveEnvironment(
-            Map<String, Object> spanAttributes, Map<String, Object> resourceAttributes) {
-        String cloudPlatform = firstString("cloud.platform", spanAttributes, resourceAttributes);
-        if (cloudPlatform != null) {
-            switch (cloudPlatform.toLowerCase(Locale.ROOT)) {
-                case "aws_api_gateway":
-                    return "api-gateway:" + valueOrDefault(
-                        firstString("aws.api_gateway.stage", spanAttributes, resourceAttributes), "default");
-                case "aws_ec2":
-                    return "ec2:default";
-                case "aws_ecs":
-                    String launchType = firstString("aws.ecs.launchtype", spanAttributes, resourceAttributes);
-                    if ("fargate".equalsIgnoreCase(launchType)) {
-                        return "ecs-fargate:default";
-                    }
-                    if ("ec2".equalsIgnoreCase(launchType)) {
-                        return "ecs-ec2:default";
-                    }
-                    return "ecs:default";
-                case "aws_eks":
-                    return "eks:default";
-                case "aws_elastic_beanstalk":
-                    return "elastic-beanstalk:default";
-                case "aws_lambda":
-                    return "lambda:default";
-                default:
-                    break;
-            }
-        }
-
-        String resourceId = firstString("cloud.resource_id", spanAttributes, resourceAttributes);
-        String invokedArn = firstString("aws.lambda.invoked_arn", spanAttributes, resourceAttributes);
-        String cloudProvider = firstString("cloud.provider", spanAttributes, resourceAttributes);
-        String functionName = firstString("faas.name", spanAttributes, resourceAttributes);
-        if ((resourceId != null && resourceId.startsWith("arn:aws:lambda:"))
-                || invokedArn != null
-                || ("aws".equalsIgnoreCase(cloudProvider) && functionName != null)) {
-            return "lambda:default";
-        }
-
-        String environment = stringValue(resourceAttributes.get("deployment.environment.name"));
-        if (environment == null) {
-            environment = stringValue(resourceAttributes.get("deployment.environment"));
-        }
-        return valueOrDefault(environment, DEFAULT_ENVIRONMENT);
-    }
-
-    @SafeVarargs
-    private static String firstString(String key, Map<String, Object>... maps) {
-        for (Map<String, Object> map : maps) {
-            String value = stringValue(map.get(key));
-            if (value != null) {
-                return value;
-            }
-        }
-        return null;
-    }
-
-    private static String valueOrDefault(String value, String defaultValue) {
-        return value == null || value.isBlank() ? defaultValue : value;
     }
 
     private static String stringValue(Object value) {
