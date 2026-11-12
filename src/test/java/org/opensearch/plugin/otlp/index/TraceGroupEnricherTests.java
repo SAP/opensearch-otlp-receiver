@@ -248,15 +248,15 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
 
     // ── minimal Client stub ───────────────────────────────────────────────────
 
-    static class StubClient extends AbstractClient {
+    public static class StubClient extends AbstractClient {
 
-        final List<SearchRequest> searchRequests = new ArrayList<>();
-        final List<BulkRequest> bulkRequests = new ArrayList<>();
+        public final List<SearchRequest> searchRequests = new ArrayList<>();
+        public final List<BulkRequest> bulkRequests = new ArrayList<>();
 
         private final List<List<Map<String, Object>>> searchResponses;
         private int searchIndex = 0;
 
-        StubClient(List<List<Map<String, Object>>> searchResponses) {
+        public StubClient(List<List<Map<String, Object>>> searchResponses) {
             super(org.opensearch.common.settings.Settings.EMPTY, null);
             this.searchResponses = searchResponses;
         }

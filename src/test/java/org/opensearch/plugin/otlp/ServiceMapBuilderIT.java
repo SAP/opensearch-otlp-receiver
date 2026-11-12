@@ -12,11 +12,18 @@ package org.opensearch.plugin.otlp;
 
 import com.google.protobuf.ByteString;
 import io.opentelemetry.proto.trace.v1.Span;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
+import org.opensearch.persistent.PersistentTasksCustomMetadata;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapBuilder;
+import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
 import org.opensearch.search.SearchHit;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -25,7 +32,9 @@ import java.util.concurrent.TimeUnit;
  */
 public class ServiceMapBuilderIT extends OTLPPluginITBase {
 
-    private static final String SERVICE_MAP_INDEX = "otel-v1-apm-service-map-test";
+    private static final String SERVICE_MAP_INDEX = "otel-v2-apm-service-map-test";
+    private static final String SERVICE_MAP_STATE_INDEX = ".opensearch-otlp-service-map-state";
+    private static final String TRACE_ID_HEX = "0a0b0c0d0e0f10111213141516171819";
 
     private static final ByteString TRACE_ID = ByteString.copyFrom(
         new byte[]{ 10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25 });
@@ -34,7 +43,15 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
     private static final ByteString CHILD_SPAN_ID = ByteString.copyFrom(
         new byte[]{ 20,21,22,23,24,25,26,27 });
 
-    // ── two-service trace produces two relationship docs ──────────────────────
+    @Override
+    protected Settings nodeSettings() {
+        return Settings.builder()
+            .put(super.nodeSettings())
+            .put("plugins.otlp.service_map.enabled", true)
+            .build();
+    }
+
+    // ── two-service trace produces one edge and one leaf observation ──────────
 
     public void testTwoServicesProduceTwoRelationships() throws Exception {
         // Root span from frontend-svc (CLIENT)
@@ -46,31 +63,109 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         refresh(TRACES_INDEX);
         assertEquals("two spans indexed", 2, searchAll(TRACES_INDEX).getHits().getTotalHits().value());
 
-        builder().run();
-        refresh(SERVICE_MAP_INDEX);
+        builder("f").run();
+        assertFalse("an unrelated prefix must not create observations",
+            client().admin().indices().prepareExists(SERVICE_MAP_INDEX).get().isExists());
 
-        assertEquals("two relationship documents in service map",
+        ServiceMapBuilder matchingBuilder = builder("0");
+        assertBusy(() -> {
+            matchingBuilder.run();
+            assertTrue("service-map index should be created after the discovery delay",
+                client().admin().indices().prepareExists(SERVICE_MAP_INDEX).get().isExists());
+        }, 10, TimeUnit.SECONDS);
+        refresh(SERVICE_MAP_INDEX);
+        assertV2Mapping();
+
+        assertEquals("one edge and one leaf document in service map",
             2, searchAll(SERVICE_MAP_INDEX).getHits().getTotalHits().value());
 
-        boolean hasDestination = false, hasTarget = false;
+        boolean hasEdge = false, hasLeaf = false;
         for (SearchHit hit : searchAll(SERVICE_MAP_INDEX).getHits().getHits()) {
             Map<String, Object> src = hit.getSourceAsMap();
-            if (src.containsKey("destination")) hasDestination = true;
-            if (src.containsKey("target")) hasTarget = true;
+            assertNotNull("timestamp is required", src.get("timestamp"));
+            assertNotNull("node hash is required", src.get("nodeConnectionHash"));
+            assertNotNull("operation hash is required", src.get("operationConnectionHash"));
+            if (src.get("targetNode") == null) {
+                hasLeaf = true;
+            } else {
+                hasEdge = true;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> sourceNode = (Map<String, Object>) src.get("sourceNode");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> targetNode = (Map<String, Object>) src.get("targetNode");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> sourceKeys = (Map<String, Object>) sourceNode.get("keyAttributes");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> targetKeys = (Map<String, Object>) targetNode.get("keyAttributes");
+                assertEquals("frontend-svc", sourceKeys.get("name"));
+                assertEquals("backend-svc", targetKeys.get("name"));
+                assertEquals("generic:default", sourceKeys.get("environment"));
+            }
         }
-        assertTrue("destination relationship doc present", hasDestination);
-        assertTrue("target relationship doc present", hasTarget);
+        assertTrue("edge document present", hasEdge);
+        assertTrue("leaf document present", hasLeaf);
+
+        refresh(SERVICE_MAP_STATE_INDEX);
+        Set<String> stateIds = new HashSet<>();
+        for (SearchHit hit : searchAll(SERVICE_MAP_STATE_INDEX).getHits().getHits()) {
+            stateIds.add(hit.getId());
+        }
+        assertTrue("cursor ID contains a configuration namespace", stateIds.stream()
+            .anyMatch(id -> id.matches("cursor:[0-9a-f]{64}:0")));
+        assertTrue("tombstone ID contains the same kind of namespace", stateIds.stream()
+            .anyMatch(id -> id.matches("trace:[0-9a-f]{64}:" + TRACE_ID_HEX)));
+        assertFalse("legacy unscoped cursor must not be reused", stateIds.contains("cursor:0"));
+        assertFalse("legacy unscoped tombstone must not be reused",
+            stateIds.contains("trace:" + TRACE_ID_HEX));
+    }
+
+    public void testPersistentTasksCoverAllTraceIdPrefixes() throws Exception {
+        ClusterService clusterService = getInstanceFromNode(ClusterService.class);
+
+        assertBusy(() -> {
+            PersistentTasksCustomMetadata metadata = clusterService.state().metadata()
+                .custom(PersistentTasksCustomMetadata.TYPE);
+            assertNotNull(metadata);
+
+            Set<String> assignedPrefixes = new HashSet<>();
+            metadata.tasks().stream()
+                .filter(task -> ServiceMapTaskParams.NAME.equals(task.getTaskName()))
+                .forEach(task -> {
+                    assertTrue(task.getAssignment().isAssigned());
+                    assignedPrefixes.add(((ServiceMapTaskParams) task.getParams()).traceIdPrefix());
+                });
+            assertEquals(Set.of("0", "1", "2", "3", "4", "5", "6", "7",
+                "8", "9", "a", "b", "c", "d", "e", "f"), assignedPrefixes);
+        }, 30, TimeUnit.SECONDS);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertV2Mapping() {
+        GetMappingsResponse response = client().admin().indices()
+            .prepareGetMappings(SERVICE_MAP_INDEX).get();
+        Map<String, Object> properties = (Map<String, Object>)
+            response.getMappings().get(SERVICE_MAP_INDEX).sourceAsMap().get("properties");
+
+        assertTrue(properties.containsKey("sourceNode"));
+        assertTrue(properties.containsKey("targetNode"));
+        assertTrue(properties.containsKey("sourceOperation"));
+        assertTrue(properties.containsKey("targetOperation"));
+        assertMappingType(properties, "nodeConnectionHash", "keyword");
+        assertMappingType(properties, "operationConnectionHash", "keyword");
+        assertMappingType(properties, "timestamp", "date");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    private ServiceMapBuilder builder() {
+    private ServiceMapBuilder builder(String traceIdPrefix) {
         return new ServiceMapBuilder(
             client(),
             getInstanceFromNode(org.opensearch.threadpool.ThreadPool.class),
             TRACES_INDEX,
             SERVICE_MAP_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
-            new TimeValue(5, TimeUnit.MINUTES));
+            new TimeValue(5, TimeUnit.MINUTES),
+            java.util.List.of(),
+            traceIdPrefix);
     }
 }
