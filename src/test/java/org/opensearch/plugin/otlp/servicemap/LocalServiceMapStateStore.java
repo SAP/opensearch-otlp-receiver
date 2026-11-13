@@ -10,18 +10,13 @@
  */
 package org.opensearch.plugin.otlp.servicemap;
 
-import java.time.Instant;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 
 /** In-memory service-map state used by unit tests. */
 final class LocalServiceMapStateStore implements ServiceMapStateStore {
 
     private final Map<Scope, Cursor> cursors = new HashMap<>();
-    private final Set<String> processedTraceIds = new HashSet<>();
 
     @Override
     public Cursor loadCursor(Scope scope) {
@@ -29,29 +24,7 @@ final class LocalServiceMapStateStore implements ServiceMapStateStore {
     }
 
     @Override
-    public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) {
-        Set<String> result = new HashSet<>();
-        for (String traceId : traceIds) {
-            if (processedTraceIds.contains(processedTraceId(scope, traceId))) {
-                result.add(traceId);
-            }
-        }
-        return result;
-    }
-
-    @Override
-    public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) {
+    public void commit(Scope scope, Cursor cursor) {
         cursors.put(scope, cursor);
-        tombstones.stream()
-            .map(TraceTombstone::traceId)
-            .map(traceId -> processedTraceId(scope, traceId))
-            .forEach(processedTraceIds::add);
-    }
-
-    @Override
-    public void deleteExpired(String prefix, Instant now) {}
-
-    private static String processedTraceId(Scope scope, String traceId) {
-        return scope.namespace() + "\u0000" + traceId;
     }
 }

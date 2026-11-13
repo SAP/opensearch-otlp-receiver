@@ -20,11 +20,9 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("unchecked")
@@ -253,6 +251,26 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertEquals("the deterministic leaf ID can be derived without metadata", leafId, delete.id());
     }
 
+    public void testCompleteTraceDeletesPotentialLeafWithoutTraceState() {
+        Map<String, Object> server = span(
+            "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
+        Map<String, Object> client = span(
+            "trace-complete", "client", "server", "checkout", "SPAN_KIND_CLIENT", "HTTP GET");
+        TraceGroupEnricherTests.StubClient stub = stub(List.of(server, client));
+
+        builder(stub, FIRST_TICK, List.of()).run();
+
+        DeleteRequest delete = onlyBulk(stub).requests().stream()
+            .filter(DeleteRequest.class::isInstance)
+            .map(DeleteRequest.class::cast)
+            .findFirst().orElseThrow();
+        assertEquals(new ServiceMapDocumentFactory(TimeUnit.MINUTES.toMillis(1))
+            .leafId(new ServiceMapSpan(
+                "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER",
+                "Checkout", FIRST_TICK.minusSeconds(30), FIRST_TICK.minusSeconds(10),
+                "generic:default", Map.of())), delete.id());
+    }
+
     public void testLateEntrySpanOverwritesEdgeWithCorrectedSourceOperation() {
         Map<String, Object> clientCall = span(
             "trace-operation", "client", "entry", "frontend",
@@ -315,15 +333,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             }
 
             @Override
-            public Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) {
-                return Set.of();
-            }
-
-            @Override
-            public void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) {}
-
-            @Override
-            public void deleteExpired(String prefix, Instant now) {}
+            public void commit(Scope scope, Cursor cursor) {}
         };
         ServiceMapBuilder builder = new ServiceMapBuilder(
             stub(List.of()),

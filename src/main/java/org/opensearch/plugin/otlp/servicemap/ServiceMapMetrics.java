@@ -114,8 +114,7 @@ public final class ServiceMapMetrics {
         DISCOVERY("discovery"),
         TRACE_LOAD("trace_load"),
         SERVICE_MAP_WRITE("service_map_write"),
-        STATE_COMMIT("state_commit"),
-        CLEANUP("cleanup");
+        STATE_COMMIT("state_commit");
 
         private final Tags tags;
 

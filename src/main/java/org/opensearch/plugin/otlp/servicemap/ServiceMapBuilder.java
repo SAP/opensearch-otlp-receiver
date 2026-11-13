@@ -51,8 +51,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Cursor;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Scope;
-import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.TraceTombstone;
-import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.CLEANUP;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.DISCOVERY;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.SERVICE_MAP_WRITE;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_COMMIT;
@@ -302,16 +300,13 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
             Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
                 TRACE_LOAD, () -> loadTraces(traceIds));
-            Set<String> previouslyProcessed = executePhase(
-                STATE_LOAD,
-                () -> stateStore.loadProcessedTraceIds(scope, traceIds));
-            executePhase(SERVICE_MAP_WRITE, () -> reconcile(spansByTrace, previouslyProcessed));
+            executePhase(SERVICE_MAP_WRITE, () -> reconcile(spansByTrace));
 
             cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
             Cursor committedCursor = cursor;
             executePhase(
                 STATE_COMMIT,
-                () -> stateStore.commit(scope, committedCursor, tombstones(spansByTrace, now)));
+                () -> stateStore.commit(scope, committedCursor));
             traceCount += spansByTrace.size();
             spanCount += spansByTrace.values().stream().mapToLong(Map::size).sum();
             if (newestIndexedAt == null || lastIndexedAt.isAfter(newestIndexedAt)) {
@@ -323,7 +318,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 break;
             }
         } while (true);
-        executePhase(CLEANUP, () -> stateStore.deleteExpired(prefix, now));
         return new RunStats(traceCount, spanCount, newestIndexedAt);
     }
 
@@ -372,8 +366,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return spansByTrace;
     }
 
-    private void reconcile(
-            Map<String, Map<String, ServiceMapSpan>> spansByTrace, Set<String> previouslyProcessed) throws Exception {
+    private void reconcile(Map<String, Map<String, ServiceMapSpan>> spansByTrace) throws Exception {
         Map<String, Map<String, Object>> documentsById = new LinkedHashMap<>();
         Set<String> deletesById = new HashSet<>();
 
@@ -403,9 +396,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                     continue;
                 }
                 if (hasClientDescendant(serverSpan, childrenByParent)) {
-                    if (!previouslyProcessed.contains(trace.getKey())) {
-                        continue;
-                    }
                     deletesById.add(documentFactory.leafId(serverSpan));
                 } else {
                     ServiceMapDocumentFactory.GeneratedDocument document = documentFactory.leaf(serverSpan);
@@ -508,27 +498,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             parseInstant(source.get("indexedAt")),
             ENVIRONMENT_RESOLVER.resolve(spanAttributes, resourceAttributes),
             groups);
-    }
-
-    private Collection<TraceTombstone> tombstones(
-            Map<String, Map<String, ServiceMapSpan>> spansByTrace, Instant now) {
-        List<TraceTombstone> tombstones = new ArrayList<>(spansByTrace.size());
-        for (Map.Entry<String, Map<String, ServiceMapSpan>> trace : spansByTrace.entrySet()) {
-            Instant lastIndexedAt = trace.getValue().values().stream()
-                .map(span -> span.indexedAt())
-                .filter(Objects::nonNull)
-                .max(Instant::compareTo)
-                .orElse(now);
-            boolean rootSeen = trace.getValue().values().stream()
-                .anyMatch(span -> span.parentSpanId() == null);
-            tombstones.add(new TraceTombstone(
-                trace.getKey(),
-                lastIndexedAt,
-                now.toEpochMilli(),
-                rootSeen,
-                lastIndexedAt.plusMillis(lookbackWindow.millis())));
-        }
-        return tombstones;
     }
 
     private static boolean isGroupValue(Object value) {

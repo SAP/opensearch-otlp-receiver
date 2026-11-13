@@ -112,11 +112,8 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
         }
         assertTrue("cursor ID contains a configuration namespace", stateIds.stream()
             .anyMatch(id -> id.matches("cursor:[0-9a-f]{64}:0")));
-        assertTrue("tombstone ID contains the same kind of namespace", stateIds.stream()
-            .anyMatch(id -> id.matches("trace:[0-9a-f]{64}:" + TRACE_ID_HEX)));
+        assertEquals("only the partition cursor is persisted", 1, stateIds.size());
         assertFalse("legacy unscoped cursor must not be reused", stateIds.contains("cursor:0"));
-        assertFalse("legacy unscoped tombstone must not be reused",
-            stateIds.contains("trace:" + TRACE_ID_HEX));
     }
 
     public void testPersistentTasksCoverAllTraceIdPrefixes() throws Exception {

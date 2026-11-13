@@ -11,24 +11,15 @@
 package org.opensearch.plugin.otlp.servicemap;
 
 import java.time.Instant;
-import java.util.Collection;
-import java.util.Set;
 
-/** Durable, small coordination state for an incremental service-map partition. */
+/** Durable cursor state for an incremental service-map partition. */
 interface ServiceMapStateStore {
 
     Cursor loadCursor(Scope scope) throws Exception;
 
-    Set<String> loadProcessedTraceIds(Scope scope, Collection<String> traceIds) throws Exception;
-
-    void commit(Scope scope, Cursor cursor, Collection<TraceTombstone> tombstones) throws Exception;
-
-    void deleteExpired(String prefix, Instant now) throws Exception;
+    void commit(Scope scope, Cursor cursor) throws Exception;
 
     record Scope(String namespace, String prefix) {}
 
     record Cursor(Instant indexedAt, String documentId) {}
-
-    record TraceTombstone(
-        String traceId, Instant lastProcessedIndexedAt, long generation, boolean rootSeen, Instant expiresAt) {}
 }
