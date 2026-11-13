@@ -13,7 +13,7 @@ package org.opensearch.plugin.otlp.servicemap;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Locale;
+import java.util.HexFormat;
 
 /** Shared deterministic hashing for service-map state and documents. */
 final class ServiceMapHashing {
@@ -21,14 +21,13 @@ final class ServiceMapHashing {
     private ServiceMapHashing() {}
 
     static String sha256Hex(String input) {
+        return HexFormat.of().formatHex(sha256(input));
+    }
+
+    static byte[] sha256(String input) {
         try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
+            return MessageDigest.getInstance("SHA-256")
                 .digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder result = new StringBuilder(digest.length * 2);
-            for (byte value : digest) {
-                result.append(String.format(Locale.ROOT, "%02x", value));
-            }
-            return result.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 is unavailable", e);
         }

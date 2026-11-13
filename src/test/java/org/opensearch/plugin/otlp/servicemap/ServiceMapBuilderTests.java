@@ -20,6 +20,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -269,6 +270,40 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
                 "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER",
                 "Checkout", FIRST_TICK.minusSeconds(30), FIRST_TICK.minusSeconds(10),
                 "generic:default", Map.of())), delete.id());
+    }
+
+    public void testDuplicateEntriesAcrossDiscoveryPagesAreWrittenOncePerRun() {
+        Map<String, Object> clientSpan = span(
+            "trace-duplicate", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items");
+        Map<String, Object> serverSpan = span(
+            "trace-duplicate", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems");
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            Collections.nCopies(10_000, clientSpan),
+            List.of(clientSpan, serverSpan),
+            List.of(serverSpan),
+            List.of(clientSpan, serverSpan)));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        BulkRequest bulk = onlyBulk(client);
+        assertEquals("one edge and one leaf are written after run-wide consolidation",
+            2, bulk.numberOfActions());
+    }
+
+    public void testUnchangedEntriesInCursorOverlapAreNotRewritten() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-overlap", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-overlap", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            spans, spans, spans, spans));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK, List.of());
+
+        builder.run();
+        builder.run();
+
+        assertEquals("the overlapping tick does not rewrite unchanged observations",
+            1, client.bulkRequests.size());
+        assertEquals(2, client.bulkRequests.get(0).numberOfActions());
     }
 
     public void testLateEntrySpanOverwritesEdgeWithCorrectedSourceOperation() {
