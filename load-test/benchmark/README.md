@@ -89,6 +89,8 @@ Use `--peer-drain-timeout` to override the two-peer delay allowance independentl
 from the normal `--drain-timeout`.
 Use `--jfr` to record the measured plugin load window with the JDK `profile`
 settings; warm-up, startup, and post-load drain are excluded from the recording.
+Use `--disable-plugin-service-map` for a plugin A/B run without service-map
+correlation; `service_map_enabled` in the result identifies each configuration.
 
 ## Interpreting the results
 

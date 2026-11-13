@@ -5,14 +5,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+BENCHMARK_PLUGIN_CONFIG="${BENCHMARK_PLUGIN_CONFIG:-$SCRIPT_DIR/opensearch-plugin.yml}"
 GENERATOR_IMAGE="opensearch-otlp-benchmark-generator:local"
 BENCHMARK_HTTP_PORT="${BENCHMARK_HTTP_PORT:-19200}"
 BENCHMARK_OTLP_PORT="${BENCHMARK_OTLP_PORT:-14317}"
 BENCHMARK_OTLP_SECONDARY_PORT="${BENCHMARK_OTLP_SECONDARY_PORT:-14318}"
 BENCHMARK_DATA_PREPPER_API_PORT="${BENCHMARK_DATA_PREPPER_API_PORT:-14900}"
 BENCHMARK_DATA_PREPPER_SECONDARY_API_PORT="${BENCHMARK_DATA_PREPPER_SECONDARY_API_PORT:-14901}"
+BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED="${BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED:-true}"
 export BENCHMARK_HTTP_PORT BENCHMARK_OTLP_PORT BENCHMARK_OTLP_SECONDARY_PORT
 export BENCHMARK_DATA_PREPPER_API_PORT BENCHMARK_DATA_PREPPER_SECONDARY_API_PORT
+export BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED BENCHMARK_PLUGIN_CONFIG
 OS_URL="http://localhost:$BENCHMARK_HTTP_PORT"
 INDEX_PATTERN="otel-v1-apm-span*"
 SERVICE_MAP_INDEX_PATTERN="otel-v*-apm-service-map*"
@@ -48,6 +51,8 @@ Usage: ./load-test/benchmark/run.sh [options]
   --peer-drain-timeout S Two-peer indexing drain wait (default: 300)
   --sample-interval SEC  Resource sampling interval (default: 2)
   --service-map-settle S Wait after span drain for service-map output (default: 5)
+  --disable-plugin-service-map
+                         Disable plugin service-map generation for an A/B run
   --results-dir PATH     Output directory (default: results/<UTC timestamp>)
   --skip-generator-build Reuse the local benchmark generator image
   --jfr                  Record plugin CPU/profile events during measured load
@@ -68,6 +73,12 @@ while [[ $# -gt 0 ]]; do
         --peer-drain-timeout) PEER_DRAIN_TIMEOUT="$2"; shift 2 ;;
         --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
         --service-map-settle) SERVICE_MAP_SETTLE_SECONDS="$2"; shift 2 ;;
+        --disable-plugin-service-map)
+            BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED=false
+            BENCHMARK_PLUGIN_CONFIG="$SCRIPT_DIR/opensearch-plugin-no-service-map.yml"
+            export BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED BENCHMARK_PLUGIN_CONFIG
+            shift
+            ;;
         --results-dir) RESULTS_DIR="$2"; shift 2 ;;
         --skip-generator-build) SKIP_GENERATOR_BUILD=true; shift ;;
         --jfr) ENABLE_JFR=true; shift ;;
@@ -329,7 +340,7 @@ wait_for_drain() {
 
 SUMMARY_CSV="$RESULTS_DIR/summary.csv"
 SUMMARY_JSONL="$RESULTS_DIR/summary.jsonl"
-echo 'scenario,target_rate,repetition,offered_records,attempted_records,unsent_records,accepted_records,rejected_records,failed_requests,source_records_per_second,rpc_p50_ms,rpc_p95_ms,rpc_p99_ms,schedule_lag_p95_ms,index_operations,index_failures,write_rejections,live_documents,drain_seconds,drain_complete,service_map_operations,service_map_live_documents,service_map_settle_seconds,peer_forwarded_records,peer_forwarding_failed_records,peer_forwarding_successful_requests,peer_forwarding_failed_requests,peer_forwarding_request_timeouts,peer_forwarding_requests_too_large,peer_forwarding_average_latency_ms,end_to_end_records_per_second,average_total_cpu_percent,peak_total_cpu_percent,average_total_memory_mib,peak_total_memory_mib' > "$SUMMARY_CSV"
+echo 'scenario,service_map_enabled,target_rate,repetition,offered_records,attempted_records,unsent_records,accepted_records,rejected_records,failed_requests,source_records_per_second,rpc_p50_ms,rpc_p95_ms,rpc_p99_ms,schedule_lag_p95_ms,index_operations,index_failures,write_rejections,live_documents,drain_seconds,drain_complete,service_map_operations,service_map_live_documents,service_map_settle_seconds,peer_forwarded_records,peer_forwarding_failed_records,peer_forwarding_successful_requests,peer_forwarding_failed_requests,peer_forwarding_request_timeouts,peer_forwarding_requests_too_large,peer_forwarding_average_latency_ms,end_to_end_records_per_second,average_total_cpu_percent,peak_total_cpu_percent,average_total_memory_mib,peak_total_memory_mib' > "$SUMMARY_CSV"
 : > "$SUMMARY_JSONL"
 
 IFS=',' read -r -a scenario_list <<< "$SCENARIOS"
@@ -341,6 +352,10 @@ for scenario in "${scenario_list[@]}"; do
         exit 2
     fi
     start_scenario "$scenario"
+    service_map_expected=true
+    if [[ "$scenario" == plugin && "$BENCHMARK_PLUGIN_SERVICE_MAP_ENABLED" != true ]]; then
+        service_map_expected=false
+    fi
     scenario_drain_timeout="$DRAIN_TIMEOUT"
     if [[ "$scenario" == dataprepper-peer ]]; then
         scenario_drain_timeout="$PEER_DRAIN_TIMEOUT"
@@ -361,11 +376,11 @@ for scenario in "${scenario_list[@]}"; do
     echo "Warm-up complete: indexed=$warmup_indexed drain=${warmup_drain}s"
     sleep "$SERVICE_MAP_SETTLE_SECONDS"
     warmup_service_map_delta=$(( $(service_map_operations) - warmup_service_map_ops ))
-    if (( warmup_service_map_delta <= 0 )); then
+    if [[ "$service_map_expected" == true ]] && (( warmup_service_map_delta <= 0 )); then
         echo "Warm-up produced no service-map indexing operations for $scenario" >&2
         exit 1
     fi
-    echo "Service-map warm-up complete: operations=$warmup_service_map_delta"
+    echo "Service-map warm-up complete: enabled=$service_map_expected operations=$warmup_service_map_delta"
     curl -s -X POST "$OS_URL/$INDEX_PATTERN/_refresh" >/dev/null 2>&1 || true
 
     for rate in "${rate_list[@]}"; do
@@ -412,7 +427,7 @@ for scenario in "${scenario_list[@]}"; do
             rejections_delta=$((final_rejections - baseline_rejections))
             service_map_ops_delta=$(( $(service_map_operations) - baseline_service_map_ops ))
             service_map_docs_delta=$(( $(service_map_documents) - baseline_service_map_docs ))
-            if (( service_map_ops_delta <= 0 )); then
+            if [[ "$service_map_expected" == true ]] && (( service_map_ops_delta <= 0 )); then
                 echo "Run produced no service-map indexing operations: $run_name" >&2
                 exit 1
             fi
@@ -477,6 +492,7 @@ for scenario in "${scenario_list[@]}"; do
 
             record=$(jq -n \
                 --arg scenario "$scenario" --argjson rate "$rate" --argjson repetition "$repetition" \
+                --argjson service_map_enabled "$service_map_expected" \
                 --argjson ops "$ops_delta" --argjson failures "$failures_delta" \
                 --argjson rejections "$rejections_delta" --argjson docs "$docs_delta" \
                 --argjson drain "$drain_seconds" --argjson end_to_end_rps "$end_to_end_rps" \
@@ -493,7 +509,7 @@ for scenario in "${scenario_list[@]}"; do
                 --argjson peer_average_latency_ms "$peer_average_latency_ms" \
                 --slurpfile generator "$run_dir/generator.json" \
                 --slurpfile resources "$run_dir/resources-summary.json" \
-                '{scenario: $scenario, target_rate: $rate, repetition: $repetition} + $generator[0] + {
+                '{scenario: $scenario, service_map_enabled: $service_map_enabled, target_rate: $rate, repetition: $repetition} + $generator[0] + {
                     index_operations: $ops, index_failures: $failures, write_rejections: $rejections,
                     live_documents: $docs, drain_seconds: $drain, drain_complete: $drain_complete,
                     service_map_operations: $service_map_ops,
@@ -510,7 +526,7 @@ for scenario in "${scenario_list[@]}"; do
                 } + $resources[0]')
             echo "$record" | jq -c . >> "$SUMMARY_JSONL"
             echo "$record" | jq -r '[
-                .scenario, .target_rate, .repetition, .offered_records, .attempted_records,
+                .scenario, .service_map_enabled, .target_rate, .repetition, .offered_records, .attempted_records,
                 .unsent_records, .accepted_records,
                 .rejected_records, .failed_requests, .accepted_records_per_second,
                 .request_latency_ms.p50, .request_latency_ms.p95, .request_latency_ms.p99,

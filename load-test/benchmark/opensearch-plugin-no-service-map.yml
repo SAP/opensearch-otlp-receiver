@@ -1,0 +1,12 @@
+cluster.name: opensearch-otlp-benchmark-plugin
+network.host: 0.0.0.0
+discovery.type: single-node
+plugins.security.disabled: true
+
+aux.transport.types: transport-grpc
+aux.transport.transport-grpc.port: 4317
+
+plugins.otlp.enabled: true
+plugins.otlp.index.create_templates: true
+plugins.otlp.service_map.enabled: false
+logger.org.opensearch.plugin.otlp: WARN

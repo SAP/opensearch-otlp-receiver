@@ -17,7 +17,7 @@ services:
       - "${BENCHMARK_HTTP_PORT:-19200}:9200"
       - "${BENCHMARK_OTLP_PORT:-14317}:4317"
     volumes:
-      - ./opensearch-plugin.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ${BENCHMARK_PLUGIN_CONFIG:?Set BENCHMARK_PLUGIN_CONFIG}:/usr/share/opensearch/config/opensearch.yml:ro
       - ${BENCHMARK_PLUGIN_ZIP:?Set BENCHMARK_PLUGIN_ZIP to the plugin zip}:/tmp/opensearch-otlp-receiver.zip:ro
     command: >
       bash -c "
