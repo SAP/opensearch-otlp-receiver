@@ -30,6 +30,7 @@ SAMPLE_INTERVAL=2
 SERVICE_MAP_SETTLE_SECONDS=5
 KEEP=false
 SKIP_GENERATOR_BUILD=false
+ENABLE_JFR=false
 RESULTS_DIR=""
 
 usage() {
@@ -49,6 +50,7 @@ Usage: ./load-test/benchmark/run.sh [options]
   --service-map-settle S Wait after span drain for service-map output (default: 5)
   --results-dir PATH     Output directory (default: results/<UTC timestamp>)
   --skip-generator-build Reuse the local benchmark generator image
+  --jfr                  Record plugin CPU/profile events during measured load
   --keep                 Leave the final scenario running
 USAGE
 }
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --service-map-settle) SERVICE_MAP_SETTLE_SECONDS="$2"; shift 2 ;;
         --results-dir) RESULTS_DIR="$2"; shift 2 ;;
         --skip-generator-build) SKIP_GENERATOR_BUILD=true; shift ;;
+        --jfr) ENABLE_JFR=true; shift ;;
         --keep) KEEP=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -97,7 +100,44 @@ compose() {
 
 ACTIVE_PROFILE=""
 SAMPLER_PID=""
+JFR_ACTIVE=false
+JFR_CONTAINER_ID=""
+JFR_JAVA_PID=""
+JFR_OUTPUT=""
+JFR_CONTAINER_FILE="/tmp/otlp-benchmark.jfr"
+JFR_NAME="otlp_benchmark"
+
+stop_jfr() {
+    if [[ "$JFR_ACTIVE" != true ]]; then
+        return
+    fi
+    local jcmd="/usr/share/opensearch/jdk/bin/jcmd"
+    docker exec "$JFR_CONTAINER_ID" "$jcmd" "$JFR_JAVA_PID" \
+        JFR.stop name="$JFR_NAME" filename="$JFR_CONTAINER_FILE" >/dev/null
+    docker cp "$JFR_CONTAINER_ID:$JFR_CONTAINER_FILE" "$JFR_OUTPUT" >/dev/null
+    JFR_ACTIVE=false
+    echo "  JFR recording: $JFR_OUTPUT"
+}
+
+start_jfr() {
+    JFR_OUTPUT="$1"
+    JFR_CONTAINER_ID=$(compose --profile plugin ps -q opensearch-plugin)
+    local jcmd="/usr/share/opensearch/jdk/bin/jcmd"
+    JFR_JAVA_PID=$(docker exec "$JFR_CONTAINER_ID" "$jcmd" -l |
+        awk '/org.opensearch.bootstrap.OpenSearch/ { print $1; exit }')
+    if [[ -z "$JFR_JAVA_PID" ]]; then
+        echo "Unable to locate the OpenSearch JVM for JFR" >&2
+        return 1
+    fi
+    docker exec "$JFR_CONTAINER_ID" "$jcmd" "$JFR_JAVA_PID" \
+        JFR.start name="$JFR_NAME" settings=profile disk=true maxsize=512m >/dev/null
+    JFR_ACTIVE=true
+}
+
 cleanup() {
+    if [[ "$JFR_ACTIVE" == true ]]; then
+        stop_jfr 2>/dev/null || true
+    fi
     if [[ -n "$SAMPLER_PID" ]]; then
         kill "$SAMPLER_PID" 2>/dev/null || true
         wait "$SAMPLER_PID" 2>/dev/null || true
@@ -347,7 +387,13 @@ for scenario in "${scenario_list[@]}"; do
             fi
 
             start_sampler "$run_dir/resources.csv" "$run_dir/opensearch-nodes.jsonl"
+            if [[ "$ENABLE_JFR" == true && "$scenario" == plugin ]]; then
+                start_jfr "$run_dir/plugin.jfr"
+            fi
             run_generator "$rate" "$DURATION_SECONDS" "$run_name-$(date +%s)" "$run_dir/generator.json" >/dev/null
+            if [[ "$JFR_ACTIVE" == true ]]; then
+                stop_jfr
+            fi
             accepted=$(jq '.accepted_records' "$run_dir/generator.json")
             read -r docs_delta drain_seconds < <(wait_for_drain \
                 "$baseline_docs" "$accepted" "$scenario_drain_timeout")

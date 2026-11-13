@@ -75,6 +75,7 @@ Results are written below `load-test/benchmark/results/<timestamp>/` and include
 - time required for accepted spans to become searchable;
 - total CPU and memory across all containers in each scenario;
 - raw per-container and OpenSearch node samples for later analysis.
+- an OpenSearch JVM flight recording for each plugin run when `--jfr` is enabled.
 
 Run `./load-test/benchmark/run.sh --help` for rate, duration, repetition, batching,
 resource sampling, and lifecycle options. Image and resource defaults can be
@@ -86,6 +87,8 @@ them with `BENCHMARK_HTTP_PORT`, `BENCHMARK_OTLP_PORT`,
 `BENCHMARK_DATA_PREPPER_SECONDARY_API_PORT`.
 Use `--peer-drain-timeout` to override the two-peer delay allowance independently
 from the normal `--drain-timeout`.
+Use `--jfr` to record the measured plugin load window with the JDK `profile`
+settings; warm-up, startup, and post-load drain are excluded from the recording.
 
 ## Interpreting the results
 
