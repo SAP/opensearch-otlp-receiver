@@ -113,6 +113,7 @@ public final class ServiceMapMetrics {
         STATE_LOAD("state_load"),
         DISCOVERY("discovery"),
         TRACE_LOAD("trace_load"),
+        RECONCILE("reconcile"),
         SERVICE_MAP_WRITE("service_map_write"),
         STATE_COMMIT("state_commit");
 

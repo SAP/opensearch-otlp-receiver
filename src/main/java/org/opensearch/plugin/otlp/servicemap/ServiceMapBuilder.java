@@ -37,14 +37,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -54,6 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Cursor;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapStateStore.Scope;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.DISCOVERY;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.RECONCILE;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.SERVICE_MAP_WRITE;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_COMMIT;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_LOAD;
@@ -92,7 +91,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final ServiceMapDocumentFactory documentFactory;
     private final String stateNamespace;
     private final ServiceMapMetrics metrics;
-    private final Map<String, CachedMutation> mutationCache = new HashMap<>();
+    private final ServiceMapMutationCache mutationCache = new ServiceMapMutationCache();
 
     private Scheduler.Cancellable scheduledTask;
     private final Cancellable cancellable = new Cancellable();
@@ -260,8 +259,8 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         long traceCount = 0;
         long spanCount = 0;
         Instant newestIndexedAt = null;
-        evictMutationCache(now);
-        ServiceMapMutations mutations = new ServiceMapMutations(mutationCache, now);
+        long cacheRetentionMillis = CURSOR_OVERLAP.millis() + DISCOVERY_DELAY.millis() + interval.millis();
+        ServiceMapMutationCache.Run mutations = mutationCache.beginRun(now, cacheRetentionMillis);
 
         do {
             QueryBuilder query = QueryBuilders.rangeQuery("indexedAt")
@@ -306,7 +305,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
             Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
                 TRACE_LOAD, () -> loadTraces(traceIds));
-            reconcile(spansByTrace, mutations);
+            executePhase(RECONCILE, () -> reconcile(spansByTrace, mutations));
 
             cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
             traceCount += spansByTrace.size();
@@ -322,7 +321,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         } while (true);
         if (newestIndexedAt != null) {
             executePhase(SERVICE_MAP_WRITE, () -> write(mutations));
-            mutations.commitTo(mutationCache);
+            mutations.commit();
             Cursor committedCursor = cursor;
             executePhase(STATE_COMMIT, () -> stateStore.commit(scope, committedCursor));
         }
@@ -375,7 +374,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     }
 
     private void reconcile(
-            Map<String, Map<String, ServiceMapSpan>> spansByTrace, ServiceMapMutations mutations) {
+            Map<String, Map<String, ServiceMapSpan>> spansByTrace, ServiceMapMutationCache.Run mutations) {
         for (Map.Entry<String, Map<String, ServiceMapSpan>> trace : spansByTrace.entrySet()) {
             Map<String, ServiceMapSpan> spansById = trace.getValue();
             Map<String, List<ServiceMapSpan>> childrenByParent = indexChildren(spansById.values());
@@ -411,21 +410,21 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         }
     }
 
-    private void write(ServiceMapMutations mutations) throws Exception {
+    private void write(ServiceMapMutationCache.Run mutations) throws Exception {
         if (mutations.isEmpty()) {
             return;
         }
 
         BulkRequest bulk = new BulkRequest();
-        for (Map.Entry<String, PendingDocument> entry : mutations.documentsById.entrySet()) {
+        for (Map.Entry<String, Map<String, Object>> entry : mutations.documents().entrySet()) {
             bulk.add(new IndexRequest(serviceMapIndex).id(entry.getKey())
-                .source(entry.getValue().source(), XContentType.JSON));
+                .source(entry.getValue(), XContentType.JSON));
             if (bulk.numberOfActions() == BULK_ACTION_LIMIT) {
                 write(bulk);
                 bulk = new BulkRequest();
             }
         }
-        for (String id : mutations.deletesById) {
+        for (String id : mutations.deletes()) {
             bulk.add(new DeleteRequest(serviceMapIndex, id));
             if (bulk.numberOfActions() == BULK_ACTION_LIMIT) {
                 write(bulk);
@@ -444,12 +443,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             throw new IllegalStateException("Failed to index service-map observations: "
                 + response.buildFailureMessage());
         }
-    }
-
-    private void evictMutationCache(Instant now) {
-        long retentionMillis = CURSOR_OVERLAP.millis() + DISCOVERY_DELAY.millis() + interval.millis();
-        Instant cutoff = now.minusMillis(retentionMillis);
-        mutationCache.values().removeIf(mutation -> mutation.lastSeen().isBefore(cutoff));
     }
 
     private static Map<String, List<ServiceMapSpan>> indexChildren(Collection<ServiceMapSpan> spans) {
@@ -605,67 +598,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     }
 
     private record RunStats(long traceCount, long spanCount, Instant newestIndexedAt) {}
-
-    private record CachedMutation(byte[] fingerprint, boolean deleted, Instant lastSeen) {}
-
-    private record PendingDocument(Map<String, Object> source, byte[] fingerprint) {}
-
-    private static final class ServiceMapMutations {
-        private final Map<String, CachedMutation> cache;
-        private final Instant now;
-        private final Map<String, PendingDocument> documentsById = new LinkedHashMap<>();
-        private final Set<String> deletesById = new LinkedHashSet<>();
-
-        private ServiceMapMutations(Map<String, CachedMutation> cache, Instant now) {
-            this.cache = cache;
-            this.now = now;
-        }
-
-        private void index(ServiceMapDocumentFactory.GeneratedDocument document) {
-            byte[] fingerprint = ServiceMapHashing.sha256(document.source().toString());
-            CachedMutation cached = touch(document.id());
-            if (cached != null && !cached.deleted() && Arrays.equals(fingerprint, cached.fingerprint())) {
-                documentsById.remove(document.id());
-                deletesById.remove(document.id());
-                return;
-            }
-            deletesById.remove(document.id());
-            documentsById.put(document.id(), new PendingDocument(document.source(), fingerprint));
-        }
-
-        private void delete(String id) {
-            CachedMutation cached = touch(id);
-            if (cached != null && cached.deleted()) {
-                documentsById.remove(id);
-                deletesById.remove(id);
-                return;
-            }
-            documentsById.remove(id);
-            deletesById.add(id);
-        }
-
-        private CachedMutation touch(String id) {
-            CachedMutation cached = cache.get(id);
-            if (cached != null) {
-                cache.put(id, new CachedMutation(cached.fingerprint(), cached.deleted(), now));
-            }
-            return cached;
-        }
-
-        private void commitTo(Map<String, CachedMutation> target) {
-            documentsById.forEach((id, document) -> target.put(
-                id, new CachedMutation(document.fingerprint(), false, now)));
-            deletesById.forEach(id -> target.put(id, new CachedMutation(null, true, now)));
-        }
-
-        private boolean isEmpty() {
-            return documentsById.isEmpty() && deletesById.isEmpty();
-        }
-
-        private int size() {
-            return documentsById.size() + deletesById.size();
-        }
-    }
 
     @FunctionalInterface
     private interface CheckedSupplier<T> {
