@@ -14,7 +14,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
-import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -69,7 +68,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private static final String CLIENT_KIND = "SPAN_KIND_CLIENT";
     private static final String SERVER_KIND = "SPAN_KIND_SERVER";
     private static final String CONSUMER_KIND = "SPAN_KIND_CONSUMER";
-    private static final String ALGORITHM_VERSION = "service-map-generation-v1";
+    private static final String ALGORITHM_VERSION = "service-map-generation-v2";
     private static final ServiceEnvironmentResolver ENVIRONMENT_RESOLVER =
         new ServiceEnvironmentResolver();
 
@@ -400,9 +399,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 if (!SERVER_KIND.equals(serverSpan.kind()) || serverSpan.serviceName() == null) {
                     continue;
                 }
-                if (hasClientDescendant(serverSpan, childrenByParent)) {
-                    mutations.delete(documentFactory.leafId(serverSpan));
-                } else {
+                if (!hasClientDescendant(serverSpan, childrenByParent)) {
                     ServiceMapDocumentFactory.GeneratedDocument document = documentFactory.leaf(serverSpan);
                     mutations.index(document);
                 }
@@ -419,13 +416,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         for (Map.Entry<String, Map<String, Object>> entry : mutations.documents().entrySet()) {
             bulk.add(new IndexRequest(serviceMapIndex).id(entry.getKey())
                 .source(entry.getValue(), XContentType.JSON));
-            if (bulk.numberOfActions() == BULK_ACTION_LIMIT) {
-                write(bulk);
-                bulk = new BulkRequest();
-            }
-        }
-        for (String id : mutations.deletes()) {
-            bulk.add(new DeleteRequest(serviceMapIndex, id));
             if (bulk.numberOfActions() == BULK_ACTION_LIMIT) {
                 write(bulk);
                 bulk = new BulkRequest();

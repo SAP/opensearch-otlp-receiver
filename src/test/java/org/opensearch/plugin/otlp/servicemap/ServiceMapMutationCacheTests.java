@@ -21,7 +21,7 @@ public class ServiceMapMutationCacheTests extends OpenSearchTestCase {
 
     public void testUnchangedDocumentIsSuppressedAfterCommit() {
         ServiceMapMutationCache cache = new ServiceMapMutationCache();
-        ServiceMapDocumentFactory.GeneratedDocument document = document("one");
+        ServiceMapDocumentFactory.GeneratedDocument document = document("id", "one");
 
         ServiceMapMutationCache.Run first = cache.beginRun(NOW, 10_000);
         first.index(document);
@@ -33,23 +33,19 @@ public class ServiceMapMutationCacheTests extends OpenSearchTestCase {
         assertTrue(overlap.isEmpty());
     }
 
-    public void testChangedDocumentAndStateTransitionsAreRetained() {
+    public void testRunConsolidatesDocumentsById() {
         ServiceMapMutationCache cache = new ServiceMapMutationCache();
-        ServiceMapMutationCache.Run first = cache.beginRun(NOW, 10_000);
-        first.index(document("one"));
-        first.commit();
+        ServiceMapMutationCache.Run run = cache.beginRun(NOW, 10_000);
+        run.index(document("id", "one"));
+        run.index(document("id", "two"));
 
-        ServiceMapMutationCache.Run changed = cache.beginRun(NOW.plusSeconds(1), 10_000);
-        changed.index(document("two"));
-        assertEquals(Map.of("value", "two"), changed.documents().get("id"));
-        changed.delete("id");
-        assertTrue(changed.documents().isEmpty());
-        assertEquals(1, changed.deletes().size());
+        assertEquals(Map.of("value", "two"), run.documents().get("id"));
+        assertEquals(1, run.size());
     }
 
     public void testExpiredFingerprintIsSafelyRewritten() {
         ServiceMapMutationCache cache = new ServiceMapMutationCache();
-        ServiceMapDocumentFactory.GeneratedDocument document = document("one");
+        ServiceMapDocumentFactory.GeneratedDocument document = document("id", "one");
         ServiceMapMutationCache.Run first = cache.beginRun(NOW, 1_000);
         first.index(document);
         first.commit();
@@ -60,7 +56,7 @@ public class ServiceMapMutationCacheTests extends OpenSearchTestCase {
         assertEquals(1, expired.size());
     }
 
-    private static ServiceMapDocumentFactory.GeneratedDocument document(String value) {
-        return new ServiceMapDocumentFactory.GeneratedDocument("id", Map.of("value", value));
+    private static ServiceMapDocumentFactory.GeneratedDocument document(String id, String value) {
+        return new ServiceMapDocumentFactory.GeneratedDocument(id, Map.of("value", value));
     }
 }

@@ -12,9 +12,12 @@ package org.opensearch.plugin.otlp.servicemap;
 
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 
 /** Creates storage-agnostic APM service-map documents and deterministic IDs. */
 final class ServiceMapDocumentFactory {
@@ -35,8 +38,7 @@ final class ServiceMapDocumentFactory {
             sourceNode, targetNode, sourceOperation, targetOperation));
         Instant bucket = eventTimeBucket(clientSpan);
         return new GeneratedDocument(
-            ServiceMapHashing.sha256Hex(String.join("\u0000", "service-map-edge-v1",
-                clientSpan.traceId(), clientSpan.spanId(), serverSpan.spanId(), bucket.toString())),
+            observationId("edge", sourceNode, targetNode, sourceOperation, targetOperation, bucket),
             document(sourceNode, targetNode, sourceOperation, targetOperation,
                 nodeHash, operationHash, DateTimeFormatter.ISO_INSTANT.format(bucket)));
     }
@@ -49,18 +51,57 @@ final class ServiceMapDocumentFactory {
             sourceNode, null, sourceOperation, null));
         Instant bucket = eventTimeBucket(serverSpan);
         return new GeneratedDocument(
-            leafId(serverSpan, bucket),
+            observationId("leaf", sourceNode, null, sourceOperation, null, bucket),
             document(sourceNode, null, sourceOperation, null, nodeHash, operationHash,
                 DateTimeFormatter.ISO_INSTANT.format(bucket)));
     }
 
-    String leafId(ServiceMapSpan serverSpan) {
-        return leafId(serverSpan, eventTimeBucket(serverSpan));
+    private static String observationId(
+            String kind,
+            NodeIdentity sourceNode,
+            NodeIdentity targetNode,
+            String sourceOperation,
+            String targetOperation,
+            Instant bucket) {
+        List<String> components = new ArrayList<>();
+        components.add("service-map-observation-v2");
+        components.add(kind);
+        addNodeIdentity(components, sourceNode);
+        addNodeIdentity(components, targetNode);
+        addNullable(components, sourceOperation);
+        addNullable(components, targetOperation);
+        components.add(bucket.toString());
+
+        StringBuilder canonical = new StringBuilder();
+        for (String component : components) {
+            canonical.append(component.length()).append(':').append(component);
+        }
+        return ServiceMapHashing.sha256Hex(canonical.toString());
     }
 
-    private static String leafId(ServiceMapSpan serverSpan, Instant bucket) {
-        return ServiceMapHashing.sha256Hex(String.join("\u0000", "service-map-leaf-v1",
-            serverSpan.traceId(), serverSpan.spanId(), bucket.toString()));
+    private static void addNodeIdentity(List<String> components, NodeIdentity node) {
+        if (node == null) {
+            components.add("node:null");
+            return;
+        }
+        components.add("node");
+        components.add(node.type());
+        components.add(node.keyAttributes().environment());
+        components.add(node.keyAttributes().name());
+        Map<String, Object> sortedGroups = new TreeMap<>(node.groupByAttributes());
+        components.add(Integer.toString(sortedGroups.size()));
+        sortedGroups.forEach((key, value) -> {
+            components.add(key);
+            components.add(value.getClass().getName());
+            components.add(String.valueOf(value));
+        });
+    }
+
+    private static void addNullable(List<String> components, String value) {
+        components.add(value == null ? "null" : "value");
+        if (value != null) {
+            components.add(value);
+        }
     }
 
     private Instant eventTimeBucket(ServiceMapSpan span) {

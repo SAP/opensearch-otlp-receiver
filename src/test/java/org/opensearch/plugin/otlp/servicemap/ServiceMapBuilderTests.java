@@ -12,7 +12,6 @@ package org.opensearch.plugin.otlp.servicemap;
 
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.test.OpenSearchTestCase;
@@ -227,7 +226,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertEquals("POST /orders", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
     }
 
-    public void testLateClientDescendantDeletesPreviouslyEmittedLeaf() {
+    public void testLateClientDescendantLeavesHistoricalLeafUntouched() {
         Map<String, Object> server = span(
             "trace-leaf", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
         Map<String, Object> internal = span(
@@ -241,18 +240,14 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         ServiceMapBuilder builder = builder(client, FIRST_TICK.plusSeconds(30), List.of());
 
         builder.run();
-        String leafId = ((IndexRequest) client.bulkRequests.get(0).requests().get(0)).id();
         builder.run();
 
-        BulkRequest correction = client.bulkRequests.get(1);
-        DeleteRequest delete = correction.requests().stream()
-            .filter(DeleteRequest.class::isInstance)
-            .map(DeleteRequest.class::cast)
-            .findFirst().orElseThrow();
-        assertEquals("the deterministic leaf ID can be derived without metadata", leafId, delete.id());
+        assertEquals("late spans do not mutate historical observations",
+            1, client.bulkRequests.size());
+        assertNull(documents(client.bulkRequests.get(0)).get(0).get("targetNode"));
     }
 
-    public void testCompleteTraceDeletesPotentialLeafWithoutTraceState() {
+    public void testCompleteTraceDoesNotEmitLeafForServerWithClientDescendant() {
         Map<String, Object> server = span(
             "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
         Map<String, Object> client = span(
@@ -261,15 +256,21 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
 
         builder(stub, FIRST_TICK, List.of()).run();
 
-        DeleteRequest delete = onlyBulk(stub).requests().stream()
-            .filter(DeleteRequest.class::isInstance)
-            .map(DeleteRequest.class::cast)
-            .findFirst().orElseThrow();
-        assertEquals(new ServiceMapDocumentFactory(TimeUnit.MINUTES.toMillis(1))
-            .leafId(new ServiceMapSpan(
-                "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER",
-                "Checkout", FIRST_TICK.minusSeconds(30), FIRST_TICK.minusSeconds(10),
-                "generic:default", Map.of())), delete.id());
+        assertTrue(stub.bulkRequests.isEmpty());
+    }
+
+    public void testEquivalentRelationshipsAcrossTracesAreConsolidated() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-a", "client-a", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-a", "server-a", "client-a", "catalog", "SPAN_KIND_SERVER", "ListItems"),
+            span("trace-b", "client-b", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-b", "server-b", "client-b", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = stub(spans);
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals("one edge and one leaf per relationship and time bucket",
+            2, onlyBulk(client).numberOfActions());
     }
 
     public void testDuplicateEntriesAcrossDiscoveryPagesAreWrittenOncePerRun() {
@@ -327,7 +328,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         builder.run();
         IndexRequest corrected = edgeRequest(client.bulkRequests.get(1));
 
-        assertEquals(original.id(), corrected.id());
+        assertNotEquals("corrected operation detail is appended as history",
+            original.id(), corrected.id());
         assertEquals("HTTP GET",
             ((Map<String, Object>) original.sourceAsMap().get("sourceOperation")).get("name"));
         assertEquals("POST /orders",

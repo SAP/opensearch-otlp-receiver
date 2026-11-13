@@ -19,23 +19,28 @@ rebalance it.
 
 Each task runs immediately after assignment and then at the configured service-map
 interval. Every ingested span carries an `indexedAt` timestamp. A task discovers
-only spans after its durable `(indexedAt, document ID)` cursor, collects the affected
-trace IDs, and fetches the complete spans for those traces before reconciliation.
-The cursor advances only after the service-map write succeeds.
+spans from its durable `(indexedAt, document ID)` cursor with a short overlap,
+collects the affected trace IDs, and fetches the complete spans for those traces
+before reconciliation. The cursor advances only after the service-map write
+succeeds.
 
-Relationship IDs are hashes of the relationship type, trace and span IDs, and the
-event-time bucket. Retrying therefore overwrites the same edge or leaf. Each trace
-also has a small expiring tombstone in the hidden
-`.opensearch-otlp-service-map-state` index. A late span reopens the trace; the task
-upserts corrected edges and deterministically deletes a leaf that is no longer a
-leaf, without storing emitted document IDs. A per-task guard prevents overlapping
-runs.
+Each run collects observations in a unit of work. Document IDs are hashes of the
+source and target nodes, source and target operations, observation kind, and
+event-time bucket. Equivalent traces therefore produce one edge or leaf per
+relationship and bucket. The same relationship in a later bucket creates another
+document, preserving service-map history.
 
-Cursor and tombstone IDs contain a namespace derived from the service-map algorithm
-version, trace and service-map indices, interval, lookback, and grouping attributes.
-Changing any effective configuration therefore starts from a fresh cursor and cannot
-reuse incompatible state. Expired tombstones from older namespaces are still cleaned
-by the task owning their trace-ID prefix.
+Leaves and edges are append-only observations. A late span can add an edge or
+corrected operation detail but does not delete an earlier leaf. Dashboards
+deduplicates topology by `nodeConnectionHash` and operation detail by
+`operationConnectionHash` within the selected time range; a leaf contributes a node
+but no edge. A short-lived in-memory write cache suppresses identical writes caused
+by cursor overlap. A per-task guard prevents overlapping runs.
+
+Cursor IDs contain a namespace derived from the service-map algorithm version, trace
+and service-map indices, interval, lookback, and grouping attributes. Changing any
+effective configuration therefore starts from a fresh cursor and cannot reuse
+incompatible state.
 
 Disabling service-map creation removes the persistent tasks. Changes to task
 configuration replace them sequentially with updated parameters.
@@ -59,19 +64,19 @@ these metrics across nodes because persistent tasks can move after a failure.
 The `outcome` values are `success`, `failure`, and `cancelled`. Processing lag is
 recorded only when a successful run discovers spans. Trace and span counters measure
 evaluation work rather than unique documents: cursor overlap, retries, and late spans
-can cause a trace to be evaluated more than once. Service-map document writes and
-deletes are intentionally left to the native metrics of the service-map index.
+can cause a trace to be evaluated more than once. Service-map document writes are
+intentionally left to the native metrics of the service-map index.
 
 Failures identify the execution phase in which the run stopped:
 
 | Phase | Work |
 |---|---|
-| `state_load` | Load the durable cursor and existing trace tombstones |
+| `state_load` | Load the durable cursor |
 | `discovery` | Find newly indexed spans for the task's trace-ID prefix |
 | `trace_load` | Load the complete affected traces and parse their spans |
-| `service_map_write` | Reconcile and write service-map edges and leaves |
-| `state_commit` | Persist the updated cursor and trace tombstones |
-| `cleanup` | Delete expired trace tombstones |
+| `reconcile` | Build and consolidate relationship observations |
+| `service_map_write` | Bulk-index service-map edges and leaves |
+| `state_commit` | Persist the updated cursor |
 
 ## Current limits
 
@@ -79,5 +84,5 @@ Failures identify the execution phase in which the run stopped:
 - Prefix searches fan out across the trace index because spans are not routed by
   `traceId`.
 - Existing assignments are not proactively rebalanced when a node joins.
-- One task holds one discovery page and the affected traces in memory while
-  correlating them.
+- One task holds the consolidated observations for its current run in memory until
+  the service-map bulk writes complete.
