@@ -35,7 +35,13 @@ class Counters:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", default="host.docker.internal:4317")
+    parser.add_argument(
+        "--endpoint",
+        action="append",
+        dest="endpoints",
+        help=("OTLP/gRPC endpoint; repeat to distribute workers across receivers "
+              "(default: host.docker.internal:4317)"),
+    )
     parser.add_argument("--rate", type=float, required=True, help="Target spans per second")
     parser.add_argument("--duration", type=float, required=True, help="Generation duration in seconds")
     parser.add_argument("--batch-size", type=int, default=100)
@@ -43,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=30.0, help="RPC timeout in seconds")
     parser.add_argument("--run-id", default="benchmark")
     args = parser.parse_args()
+    if not args.endpoints:
+        args.endpoints = ["host.docker.internal:4317"]
     if args.rate <= 0 or args.duration <= 0 or args.batch_size <= 0 or args.concurrency <= 0:
         parser.error("rate, duration, batch-size, and concurrency must be positive")
     if args.batch_size % 2 != 0:
@@ -124,7 +132,8 @@ async def run_worker(
     deadline: float,
     counters: Counters,
 ) -> None:
-    channel = grpc.aio.insecure_channel(args.endpoint)
+    endpoint = args.endpoints[worker_id % len(args.endpoints)]
+    channel = grpc.aio.insecure_channel(endpoint)
     stub = TraceServiceStub(channel)
     period = args.batch_size * args.concurrency / args.rate
     next_send = start + worker_id * period / args.concurrency
@@ -135,7 +144,10 @@ async def run_worker(
             delay = next_send - time.perf_counter()
             if delay > 0:
                 await asyncio.sleep(delay)
-            counters.schedule_lags_ms.append(max(0, (time.perf_counter() - next_send) * 1000))
+            now = time.perf_counter()
+            if now >= deadline:
+                break
+            counters.schedule_lags_ms.append(max(0, (now - next_send) * 1000))
             sequence = worker_id * 1_000_000_000_000 + batch_number * args.batch_size
             request = request_for(args.run_id, sequence, args.batch_size)
             counters.attempted += args.batch_size
@@ -167,21 +179,24 @@ async def main() -> None:
         run_worker(worker, args, started, deadline, counters)
         for worker in range(args.concurrency)
     ))
-    # The final scheduled batch can precede the end of the open-loop window.
     # Keep the process alive until the requested boundary so throughput uses the
-    # complete generation interval instead of only first-to-last request time.
+    # complete fixed-duration offered-load window.
     remaining = deadline - time.perf_counter()
     if remaining > 0:
         await asyncio.sleep(remaining)
     elapsed = time.perf_counter() - started
 
+    offered_records = round(args.rate * args.duration)
     result = {
         "run_id": args.run_id,
         "target_rate": args.rate,
         "duration_seconds": round(elapsed, 3),
         "batch_size": args.batch_size,
         "concurrency": args.concurrency,
+        "endpoints": args.endpoints,
         "attempted_records": counters.attempted,
+        "offered_records": offered_records,
+        "unsent_records": max(0, offered_records - counters.attempted),
         "accepted_records": counters.accepted,
         "rejected_records": counters.rejected,
         "requests": counters.requests,

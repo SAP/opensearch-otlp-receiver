@@ -32,7 +32,7 @@ services:
       retries: 60
 
   opensearch-baseline:
-    profiles: [dataprepper]
+    profiles: [dataprepper, dataprepper-peer]
     image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-3.9.0}
     environment:
       - discovery.type=single-node
@@ -67,7 +67,41 @@ services:
       - "${BENCHMARK_DATA_PREPPER_API_PORT:-14900}:4900"
     volumes:
       - ./data-prepper-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml:ro
-      - ./data-prepper-pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
+      - ./data-prepper-v2-pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
+    depends_on:
+      opensearch-baseline:
+        condition: service_healthy
+
+  data-prepper-peer-1:
+    profiles: [dataprepper-peer]
+    image: opensearchproject/data-prepper:${DATA_PREPPER_VERSION:-2.17.0}
+    environment:
+      - JAVA_OPTS=-Xms1g -Xmx1g
+    cpus: ${DATA_PREPPER_CPUS:-2.0}
+    mem_limit: ${DATA_PREPPER_MEMORY:-2g}
+    ports:
+      - "${BENCHMARK_OTLP_PORT:-14317}:21890"
+      - "${BENCHMARK_DATA_PREPPER_API_PORT:-14900}:4900"
+    volumes:
+      - ./data-prepper-peer-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml:ro
+      - ./data-prepper-v2-pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
+    depends_on:
+      opensearch-baseline:
+        condition: service_healthy
+
+  data-prepper-peer-2:
+    profiles: [dataprepper-peer]
+    image: opensearchproject/data-prepper:${DATA_PREPPER_VERSION:-2.17.0}
+    environment:
+      - JAVA_OPTS=-Xms1g -Xmx1g
+    cpus: ${DATA_PREPPER_CPUS:-2.0}
+    mem_limit: ${DATA_PREPPER_MEMORY:-2g}
+    ports:
+      - "${BENCHMARK_OTLP_SECONDARY_PORT:-14318}:21890"
+      - "${BENCHMARK_DATA_PREPPER_SECONDARY_API_PORT:-14901}:4900"
+    volumes:
+      - ./data-prepper-peer-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml:ro
+      - ./data-prepper-v2-pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
     depends_on:
       opensearch-baseline:
         condition: service_healthy
