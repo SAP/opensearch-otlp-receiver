@@ -60,6 +60,17 @@ terminal and captured in CI or other non-interactive environments. Set
 `E2E_QUIET=true` or `E2E_QUIET=false` to override that detection; captured output
 is printed when a test fails.
 
+### Performance benchmark
+
+The reproducible OTLP/gRPC trace benchmark compares direct plugin ingestion with
+Data Prepper and records throughput, RPC latency, index drain time, failures, CPU,
+and memory. See [load-test/benchmark/README.md](load-test/benchmark/README.md).
+
+```bash
+./gradlew assemble
+./load-test/benchmark/run.sh
+```
+
 ### Install into OpenSearch
 
 ```bash

@@ -1,1 +1,4 @@
 stats.csv
+benchmark/results/
+benchmark/**/__pycache__/
+benchmark/**/*.pyc

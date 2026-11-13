@@ -1,0 +1,73 @@
+services:
+  opensearch-plugin:
+    profiles: [plugin]
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-3.9.0}
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_1234!
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    cpus: ${OPENSEARCH_CPUS:-2.0}
+    mem_limit: ${OPENSEARCH_MEMORY:-2g}
+    ports:
+      - "${BENCHMARK_HTTP_PORT:-19200}:9200"
+      - "${BENCHMARK_OTLP_PORT:-14317}:4317"
+    volumes:
+      - ./opensearch-plugin.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ${BENCHMARK_PLUGIN_ZIP:?Set BENCHMARK_PLUGIN_ZIP to the plugin zip}:/tmp/opensearch-otlp-receiver.zip:ro
+    command: >
+      bash -c "
+        opensearch-plugin remove opensearch-otlp-receiver --purge 2>/dev/null || true &&
+        opensearch-plugin install --batch file:///tmp/opensearch-otlp-receiver.zip &&
+        /usr/share/opensearch/bin/opensearch
+      "
+    healthcheck:
+      test: [CMD, curl, -sf, http://localhost:9200/_cluster/health]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  opensearch-baseline:
+    profiles: [dataprepper]
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-3.9.0}
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_1234!
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    cpus: ${OPENSEARCH_CPUS:-2.0}
+    mem_limit: ${OPENSEARCH_MEMORY:-2g}
+    ports:
+      - "${BENCHMARK_HTTP_PORT:-19200}:9200"
+    volumes:
+      - ./opensearch-baseline.yml:/usr/share/opensearch/config/opensearch.yml:ro
+    healthcheck:
+      test: [CMD, curl, -sf, http://localhost:9200/_cluster/health]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  data-prepper:
+    profiles: [dataprepper]
+    image: opensearchproject/data-prepper:${DATA_PREPPER_VERSION:-2.17.0}
+    environment:
+      - JAVA_OPTS=-Xms1g -Xmx1g
+    cpus: ${DATA_PREPPER_CPUS:-2.0}
+    mem_limit: ${DATA_PREPPER_MEMORY:-2g}
+    ports:
+      - "${BENCHMARK_OTLP_PORT:-14317}:21890"
+      - "${BENCHMARK_DATA_PREPPER_API_PORT:-14900}:4900"
+    volumes:
+      - ./data-prepper-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml:ro
+      - ./data-prepper-pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
+    depends_on:
+      opensearch-baseline:
+        condition: service_healthy
