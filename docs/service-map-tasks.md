@@ -22,7 +22,8 @@ interval. Every ingested span carries an `indexedAt` timestamp. A task discovers
 spans from its durable `(indexedAt, document ID)` cursor with a short overlap,
 collects the affected trace IDs, and fetches the complete spans for those traces
 before reconciliation. The cursor advances only after the service-map write
-succeeds.
+succeeds. See the [ServiceMapBuilder activity diagram](service-map-builder-activity.md)
+for the complete run and failure flow.
 
 Each run collects observations in a unit of work. Document IDs are hashes of the
 source and target nodes, source and target operations, observation kind, and
