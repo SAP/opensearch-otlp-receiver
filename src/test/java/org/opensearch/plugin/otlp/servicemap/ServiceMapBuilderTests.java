@@ -10,10 +10,20 @@
  */
 package org.opensearch.plugin.otlp.servicemap;
 
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.ActionType;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.action.ActionResponse;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
+import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Clock;
@@ -160,6 +170,14 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertTrue(query, query.contains("prefix"));
         assertTrue(query, query.contains("traceId"));
         assertTrue(query, query.contains("\"value\" : \"a\""));
+    }
+
+    public void testTimedOutDiscoveryDoesNotWriteOrCommit() {
+        assertIncompleteSearchRejected(0, incompleteSearchResponse(true, false), "discovery");
+    }
+
+    public void testPartialTraceLoadDoesNotWriteOrCommit() {
+        assertIncompleteSearchRejected(1, incompleteSearchResponse(false, true), "trace_load");
     }
 
     public void testStateNamespaceTracksEffectiveConfiguration() {
@@ -398,6 +416,60 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         return new TraceGroupEnricherTests.StubClient(List.of(spans, spans));
     }
 
+    private static void assertIncompleteSearchRejected(
+            int incompleteSearchIndex, SearchResponse incompleteResponse, String expectedPhase) {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-incomplete", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-incomplete", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        IncompleteSearchClient client = new IncompleteSearchClient(
+            List.of(spans), incompleteSearchIndex, incompleteResponse);
+        RecordingStateStore stateStore = new RecordingStateStore();
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+        ServiceMapBuilder builder = new ServiceMapBuilder(
+            client,
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(FIRST_TICK, ZoneOffset.UTC),
+            stateStore,
+            metrics);
+
+        builder.run();
+
+        assertTrue("incomplete search must not write service-map documents",
+            client.bulkRequests.isEmpty());
+        assertEquals("incomplete search must not advance the cursor", 0, stateStore.commitCount);
+        assertEquals(Boolean.FALSE,
+            client.searchRequests.get(incompleteSearchIndex).allowPartialSearchResults());
+        assertEquals("failure",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals(expectedPhase,
+            registry.counter(ServiceMapMetrics.FAILURES).samples.get(0).tags().get("phase"));
+    }
+
+    private static SearchResponse incompleteSearchResponse(boolean timedOut, boolean failedShard) {
+        SearchHits searchHits = new SearchHits(new SearchHit[0], null, 1.0f);
+        InternalSearchResponse internal = new InternalSearchResponse(
+            searchHits, null, null, null, timedOut, false, 1);
+        ShardSearchFailure[] failures = failedShard
+            ? new ShardSearchFailure[]{
+                new ShardSearchFailure(new IllegalStateException("shard unavailable"))
+            }
+            : ShardSearchFailure.EMPTY_ARRAY;
+        return new SearchResponse(
+            internal, null, 1, failedShard ? 0 : 1, 0, 0,
+            failures, SearchResponse.Clusters.EMPTY);
+    }
+
     private static ServiceMapBuilder builder(
             TraceGroupEnricherTests.StubClient client, Instant time, List<String> groupByAttributes) {
         return builder(client, time, groupByAttributes, null);
@@ -478,5 +550,47 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         Map<String, Object> keys = (Map<String, Object>) node.get("keyAttributes");
         assertEquals(name, keys.get("name"));
         assertEquals(environment, keys.get("environment"));
+    }
+
+    private static final class IncompleteSearchClient extends TraceGroupEnricherTests.StubClient {
+        private final int incompleteSearchIndex;
+        private final SearchResponse incompleteResponse;
+        private int searchCount;
+
+        private IncompleteSearchClient(
+                List<List<Map<String, Object>>> searchResponses,
+                int incompleteSearchIndex,
+                SearchResponse incompleteResponse) {
+            super(searchResponses);
+            this.incompleteSearchIndex = incompleteSearchIndex;
+            this.incompleteResponse = incompleteResponse;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        protected <Request extends ActionRequest, Response extends ActionResponse>
+        void doExecute(ActionType<Response> action, Request request, ActionListener<Response> listener) {
+            if (request instanceof SearchRequest searchRequest
+                    && searchCount++ == incompleteSearchIndex) {
+                searchRequests.add(searchRequest);
+                listener.onResponse((Response) incompleteResponse);
+                return;
+            }
+            super.doExecute(action, request, listener);
+        }
+    }
+
+    private static final class RecordingStateStore implements ServiceMapStateStore {
+        private int commitCount;
+
+        @Override
+        public Cursor loadCursor(Scope scope) {
+            return null;
+        }
+
+        @Override
+        public void commit(Scope scope, Cursor cursor) {
+            commitCount++;
+        }
     }
 }

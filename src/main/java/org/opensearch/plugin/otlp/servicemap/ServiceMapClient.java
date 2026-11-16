@@ -28,6 +28,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.plugin.otlp.common.Cancellable;
 import org.opensearch.transport.client.Client;
 
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -48,7 +49,9 @@ final class ServiceMapClient {
     }
 
     CompletableFuture<SearchResponse> search(SearchRequest request) {
-        return execute(listener -> client.search(request, listener));
+        request.allowPartialSearchResults(false);
+        return this.<SearchResponse>execute(listener -> client.search(request, listener))
+            .thenApply(ServiceMapClient::requireCompleteSearch);
     }
 
     CompletableFuture<BulkResponse> bulk(BulkRequest request) {
@@ -73,6 +76,19 @@ final class ServiceMapClient {
 
     CompletableFuture<ClusterHealthResponse> health(ClusterHealthRequest request) {
         return execute(listener -> client.admin().cluster().health(request, listener));
+    }
+
+    private static SearchResponse requireCompleteSearch(SearchResponse response) {
+        if (response.isTimedOut()) {
+            throw new IllegalStateException("Service-map search timed out");
+        }
+        if (response.getFailedShards() > 0) {
+            throw new IllegalStateException(
+                "Service-map search returned partial results: failedShards="
+                    + response.getFailedShards() + ", failures="
+                    + Arrays.toString(response.getShardFailures()));
+        }
+        return response;
     }
 
     private <T> CompletableFuture<T> execute(Consumer<ActionListener<T>> operation) {
