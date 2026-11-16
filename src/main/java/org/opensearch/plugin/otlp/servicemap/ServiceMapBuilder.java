@@ -14,6 +14,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -42,6 +44,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -74,11 +77,6 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private static final ServiceEnvironmentResolver ENVIRONMENT_RESOLVER =
         new ServiceEnvironmentResolver();
 
-    private static final String[] SOURCE_FIELDS = {
-        "traceId", "spanId", "parentSpanId", "serviceName", "kind", "name",
-        "startTime", "endTime", "indexedAt", "attributes", "resource.attributes"
-    };
-
     private final ServiceMapClient serviceMapClient;
     private final ThreadPool threadPool;
     private final String tracesIndex;
@@ -93,6 +91,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
     private final String stateNamespace;
     private final ServiceMapMetrics metrics;
     private final ServiceMapMutationCache mutationCache = new ServiceMapMutationCache();
+    private ServiceMapTraceLoadPlan traceLoadPlan;
 
     private Scheduler.Cancellable scheduledTask;
     private final Cancellable cancellable = new Cancellable();
@@ -319,10 +318,11 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
         } while (true);
         if (newestIndexedAt != null) {
+            ServiceMapTraceLoadPlan loadPlan = traceLoadPlan();
             for (int offset = 0; offset < traceIds.size(); offset += TRACE_ID_PARTITION_SIZE) {
                 List<String> partition = traceIds.partition(offset, TRACE_ID_PARTITION_SIZE);
                 Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
-                    TRACE_LOAD, () -> loadTraces(partition));
+                    TRACE_LOAD, () -> loadTraces(partition, loadPlan));
                 executePhase(RECONCILE, () -> reconcile(spansByTrace, mutations));
                 traceCount += spansByTrace.size();
                 spanCount += spansByTrace.values().stream().mapToLong(Map::size).sum();
@@ -347,7 +347,34 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return current;
     }
 
-    private Map<String, Map<String, ServiceMapSpan>> loadTraces(Collection<String> traceIds) throws Exception {
+    private ServiceMapTraceLoadPlan traceLoadPlan() throws Exception {
+        if (traceLoadPlan != null) {
+            return traceLoadPlan;
+        }
+        try {
+            FieldCapabilitiesRequest request = new FieldCapabilitiesRequest()
+                .indices(tracesIndex + "*")
+                .fields(ServiceMapTraceLoadPlan.requestedFields(groupByAttributes))
+                .includeUnmapped(true);
+            FieldCapabilitiesResponse response = serviceMapClient.fieldCapabilities(request).get();
+            traceLoadPlan = ServiceMapTraceLoadPlan.resolve(response, groupByAttributes);
+            if (!traceLoadPlan.fallbackFields().isEmpty()) {
+                LOG.warn("Service-map trace loading uses _source for fields without doc values: {}",
+                    traceLoadPlan.fallbackFields());
+            }
+            return traceLoadPlan;
+        } catch (Exception e) {
+            if (cancellable.isCancelled()) {
+                throw e;
+            }
+            LOG.warn("Unable to inspect service-map field capabilities; using filtered _source for trace loading", e);
+            traceLoadPlan = ServiceMapTraceLoadPlan.sourceFallback();
+            return traceLoadPlan;
+        }
+    }
+
+    private Map<String, Map<String, ServiceMapSpan>> loadTraces(
+            Collection<String> traceIds, ServiceMapTraceLoadPlan loadPlan) throws Exception {
         Map<String, Map<String, ServiceMapSpan>> spansByTrace = new LinkedHashMap<>();
         if (traceIds.isEmpty()) {
             return spansByTrace;
@@ -356,18 +383,18 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         do {
             SearchSourceBuilder source = new SearchSourceBuilder()
                 .size(PAGE_SIZE)
-                .fetchSource(SOURCE_FIELDS, null)
                 .query(QueryBuilders.termsQuery("traceId", traceIds))
                 .sort("_index", SortOrder.ASC)
                 .sort("traceId", SortOrder.ASC)
                 .sort("spanId", SortOrder.ASC);
+            loadPlan.apply(source);
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
             }
             SearchHit[] hits = serviceMapClient.search(new SearchRequest(tracesIndex + "*").source(source))
                 .get().getHits().getHits();
             for (SearchHit hit : hits) {
-                ServiceMapSpan span = parseSpan(hit.getSourceAsMap());
+                ServiceMapSpan span = parseSpan(hit);
                 if (span != null) {
                     spansByTrace.computeIfAbsent(span.traceId(), ignored -> new LinkedHashMap<>())
                         .put(span.spanId(), span);
@@ -488,17 +515,27 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return span.operationName();
     }
 
-    private ServiceMapSpan parseSpan(Map<String, Object> source) {
-        String traceId = stringValue(source.get("traceId"));
-        String spanId = stringValue(source.get("spanId"));
+    private ServiceMapSpan parseSpan(SearchHit hit) {
+        Map<String, Object> source = hit.getSourceAsMap();
+        if (source == null) {
+            source = Map.of();
+        }
+        String traceId = stringValue(hitValue(hit, source, "traceId"));
+        String spanId = stringValue(hitValue(hit, source, "spanId"));
         if (traceId == null || spanId == null) {
             LOG.debug("Skipping span without traceId/spanId");
             return null;
         }
 
-        Map<String, Object> spanAttributes = objectMap(source.get("attributes"));
+        Map<String, Object> spanAttributes = new LinkedHashMap<>(objectMap(source.get("attributes")));
+        addDocValueAttributes(hit, "attributes.",
+            ServiceMapTraceLoadPlan.SPAN_ATTRIBUTE_KEYS, spanAttributes);
         Map<String, Object> resource = objectMap(source.get("resource"));
-        Map<String, Object> resourceAttributes = objectMap(resource.get("attributes"));
+        Map<String, Object> resourceAttributes = new LinkedHashMap<>(objectMap(resource.get("attributes")));
+        LinkedHashSet<String> resourceAttributeKeys =
+            new LinkedHashSet<>(ServiceMapTraceLoadPlan.RESOURCE_ATTRIBUTE_KEYS);
+        resourceAttributeKeys.addAll(groupByAttributes);
+        addDocValueAttributes(hit, "resource.attributes.", resourceAttributeKeys, resourceAttributes);
         Map<String, Object> groups = new LinkedHashMap<>();
         for (String attribute : groupByAttributes) {
             Object value = resourceAttributes.get(attribute);
@@ -510,14 +547,29 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return new ServiceMapSpan(
             traceId,
             spanId,
-            stringValue(source.get("parentSpanId")),
-            stringValue(source.get("serviceName")),
-            stringValue(source.get("kind")),
-            stringValue(source.get("name")),
-            parseInstant(source.get("endTime")),
-            parseInstant(source.get("indexedAt")),
+            stringValue(hitValue(hit, source, "parentSpanId")),
+            stringValue(hitValue(hit, source, "serviceName")),
+            stringValue(hitValue(hit, source, "kind")),
+            stringValue(hitValue(hit, source, "name")),
+            parseInstant(hitValue(hit, source, "endTime")),
+            parseInstant(hitValue(hit, source, "indexedAt")),
             ENVIRONMENT_RESOLVER.resolve(spanAttributes, resourceAttributes),
             groups);
+    }
+
+    private static Object hitValue(SearchHit hit, Map<String, Object> source, String field) {
+        Object docValue = fieldValue(hit, field);
+        return docValue != null ? docValue : source.get(field);
+    }
+
+    private static void addDocValueAttributes(
+            SearchHit hit, String prefix, Collection<String> keys, Map<String, Object> attributes) {
+        for (String key : keys) {
+            Object value = fieldValue(hit, prefix + key);
+            if (value != null) {
+                attributes.put(key, value);
+            }
+        }
     }
 
     private static boolean isGroupValue(Object value) {

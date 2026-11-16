@@ -31,8 +31,9 @@ flowchart TD
         nextPage --> discover
         fullPage -- No --> observations
         observations -- No --> stats[Return run statistics]
-        observations -- Yes --> partition[Re-encode one bounded trace-ID partition]
-        partition --> loadTraces[Load all spans for the partition<br/>using search_after pages<br/><i>trace_load</i>]
+        observations -- Yes --> resolveFields[Resolve field capabilities once<br/>Prefer doc values; retain filtered _source<br/>fallback for incompatible mappings]
+        resolveFields --> partition[Re-encode one bounded trace-ID partition]
+        partition --> loadTraces[Load all spans for the partition<br/>using doc values and search_after pages<br/><i>trace_load</i>]
         loadTraces --> reconcile[Reconcile each trace<br/><i>reconcile</i>]
 
         subgraph trace["For each affected trace"]
@@ -70,9 +71,9 @@ flowchart TD
 
 ## Processing guarantees
 
-- Discovery reads only the `traceId` and `indexedAt` doc values. Full `_source` is
-  loaded only after discovery completes and only for bounded partitions of unique
-  affected traces.
+- Discovery reads only the `traceId` and `indexedAt` doc values. Trace loading also
+  uses doc values for compatible scalar and service-map attribute fields. Filtered
+  `_source` is requested only for fields whose mappings cannot provide doc values.
 - The cursor overlap allows late visibility and retry. Stable document IDs, the
   per-run unit of work, and the short-lived mutation cache prevent redundant
   service-map writes.

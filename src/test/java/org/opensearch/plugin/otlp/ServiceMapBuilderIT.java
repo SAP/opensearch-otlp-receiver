@@ -21,7 +21,9 @@ import org.opensearch.plugin.otlp.servicemap.ServiceMapBuilder;
 import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
 import org.opensearch.search.SearchHit;
 
+import java.time.Instant;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -137,6 +139,38 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
     }
 
     @SuppressWarnings("unchecked")
+    public void testEnvironmentAndGroupingAttributesLoadFromDocValues() throws Exception {
+        Instant eventTime = Instant.now().minusSeconds(10);
+        client().prepareIndex(TRACES_INDEX)
+            .setId("service-map-doc-values")
+            .setSource(Map.of(
+                "traceId", TRACE_ID_HEX,
+                "spanId", "0a0b0c0d0e0f1011",
+                "serviceName", "payments",
+                "kind", "SPAN_KIND_SERVER",
+                "name", "charge",
+                "endTime", eventTime.toString(),
+                "indexedAt", eventTime.toString(),
+                "resource", Map.of("attributes", Map.of(
+                    "deployment.environment.name", "production",
+                    "service.version", "2.4.0"))))
+            .get();
+        refresh(TRACES_INDEX);
+
+        builder("0", List.of("service.version")).run();
+        refresh(SERVICE_MAP_INDEX);
+
+        SearchHit hit = searchAll(SERVICE_MAP_INDEX).getHits().getAt(0);
+        Map<String, Object> sourceNode = (Map<String, Object>)
+            hit.getSourceAsMap().get("sourceNode");
+        Map<String, Object> keyAttributes = (Map<String, Object>)
+            sourceNode.get("keyAttributes");
+        assertEquals("production", keyAttributes.get("environment"));
+        assertEquals(Map.of("service.version", "2.4.0"),
+            sourceNode.get("groupByAttributes"));
+    }
+
+    @SuppressWarnings("unchecked")
     private void assertV2Mapping() {
         GetMappingsResponse response = client().admin().indices()
             .prepareGetMappings(SERVICE_MAP_INDEX).get();
@@ -155,6 +189,10 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private ServiceMapBuilder builder(String traceIdPrefix) {
+        return builder(traceIdPrefix, List.of());
+    }
+
+    private ServiceMapBuilder builder(String traceIdPrefix, List<String> groupByAttributes) {
         return new ServiceMapBuilder(
             client(),
             getInstanceFromNode(org.opensearch.threadpool.ThreadPool.class),
@@ -162,7 +200,7 @@ public class ServiceMapBuilderIT extends OTLPPluginITBase {
             SERVICE_MAP_INDEX,
             new TimeValue(60, TimeUnit.SECONDS),
             new TimeValue(5, TimeUnit.MINUTES),
-            java.util.List.of(),
+            groupByAttributes,
             traceIdPrefix);
     }
 }

@@ -16,6 +16,8 @@ import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesResponse;
 import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.get.MultiGetRequest;
@@ -52,6 +54,10 @@ final class ServiceMapClient {
         request.allowPartialSearchResults(false);
         return this.<SearchResponse>execute(listener -> client.search(request, listener))
             .thenApply(ServiceMapClient::requireCompleteSearch);
+    }
+
+    CompletableFuture<FieldCapabilitiesResponse> fieldCapabilities(FieldCapabilitiesRequest request) {
+        return execute(listener -> client.fieldCaps(request, listener));
     }
 
     CompletableFuture<BulkResponse> bulk(BulkRequest request) {

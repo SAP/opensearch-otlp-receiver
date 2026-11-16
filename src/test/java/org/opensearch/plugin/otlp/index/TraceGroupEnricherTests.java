@@ -15,6 +15,9 @@ import org.opensearch.action.ActionType;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.fieldcaps.FieldCapabilities;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
@@ -37,6 +40,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.common.xcontent.XContentFactory.jsonBuilder;
@@ -253,13 +257,21 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
 
         public final List<SearchRequest> searchRequests = new ArrayList<>();
         public final List<BulkRequest> bulkRequests = new ArrayList<>();
+        public final List<FieldCapabilitiesRequest> fieldCapabilitiesRequests = new ArrayList<>();
 
         private final List<List<Map<String, Object>>> searchResponses;
+        private final Set<String> sourceOnlyFields;
         private int searchIndex = 0;
 
         public StubClient(List<List<Map<String, Object>>> searchResponses) {
+            this(searchResponses, Set.of());
+        }
+
+        public StubClient(
+                List<List<Map<String, Object>>> searchResponses, Set<String> sourceOnlyFields) {
             super(org.opensearch.common.settings.Settings.EMPTY, null);
             this.searchResponses = searchResponses;
+            this.sourceOnlyFields = Set.copyOf(sourceOnlyFields);
         }
 
         @Override
@@ -275,6 +287,19 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
                 } catch (IOException e) {
                     listener.onFailure(e);
                 }
+            } else if (request instanceof FieldCapabilitiesRequest fieldCapabilitiesRequest) {
+                fieldCapabilitiesRequests.add(fieldCapabilitiesRequest);
+                Map<String, Map<String, FieldCapabilities>> fields = new HashMap<>();
+                for (String field : fieldCapabilitiesRequest.fields()) {
+                    boolean sourceOnly = sourceOnlyFields.contains(field);
+                    fields.put(field, Map.of(
+                        sourceOnly ? "text" : "keyword",
+                        new FieldCapabilities(
+                            field, sourceOnly ? "text" : "keyword", true, !sourceOnly,
+                            null, null, null, Map.of())));
+                }
+                listener.onResponse((Response) new FieldCapabilitiesResponse(
+                    new String[]{"otel-v1-apm-span-test"}, fields));
             } else if (request instanceof BulkRequest br) {
                 bulkRequests.add(br);
                 listener.onResponse((Response) new BulkResponse(new BulkItemResponse[0], 0));
@@ -293,11 +318,19 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
                 builder.map(sources.get(i));
                 SearchHit hit = new SearchHit(i, "id" + i, null, null);
                 hit.sourceRef(new BytesArray(builder.toString()));
-                for (String field : List.of("traceId", "indexedAt")) {
+                for (String field : List.of(
+                        "traceId", "spanId", "parentSpanId", "serviceName",
+                        "kind", "name", "endTime", "indexedAt")) {
                     Object value = sources.get(i).get(field);
                     if (value != null) {
                         hit.setDocumentField(field, new DocumentField(field, List.of(value)));
                     }
+                }
+                addAttributeDocumentFields(hit, "attributes.", sources.get(i).get("attributes"));
+                Object resource = sources.get(i).get("resource");
+                if (resource instanceof Map<?, ?> resourceMap) {
+                    addAttributeDocumentFields(
+                        hit, "resource.attributes.", resourceMap.get("attributes"));
                 }
                 // Set sort values so searchAfter can be used by callers
                 hit.sortValues(new Object[]{"id" + i}, new DocValueFormat[]{DocValueFormat.RAW});
@@ -308,6 +341,20 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
                 searchHits, null, null, null, false, false, 1);
             return new SearchResponse(internal, null, 1, 1, 0, 0,
                 ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
+        }
+
+        private static void addAttributeDocumentFields(
+                SearchHit hit, String prefix, Object attributes) {
+            if (!(attributes instanceof Map<?, ?> attributeMap)) {
+                return;
+            }
+            attributeMap.forEach((key, value) -> {
+                if (key instanceof String stringKey
+                        && (value instanceof String || value instanceof Number || value instanceof Boolean)) {
+                    hit.setDocumentField(prefix + stringKey,
+                        new DocumentField(prefix + stringKey, List.of(value)));
+                }
+            });
         }
     }
 }

@@ -24,6 +24,7 @@ import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.test.OpenSearchTestCase;
@@ -36,6 +37,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("unchecked")
@@ -191,6 +193,47 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
                 .map(sort -> ((FieldSortBuilder) sort).getFieldName())
                 .toList());
         assertFalse(source.toString(), source.toString().contains("\"_id\""));
+    }
+
+    public void testTraceLoadUsesDocValuesWithoutSource() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-doc-values", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals(1, client.fieldCapabilitiesRequests.size());
+        SearchSourceBuilder source = client.searchRequests.get(1).source();
+        assertFalse(source.fetchSource().fetchSource());
+        List<String> docValueFields = source.docValueFields().stream()
+            .map(field -> field.field).toList();
+        assertTrue(docValueFields.containsAll(List.of(
+            "traceId", "spanId", "parentSpanId", "serviceName",
+            "kind", "name", "endTime", "indexedAt")));
+        assertFalse(docValueFields.contains("startTime"));
+        assertTrue(docValueFields.contains("attributes.cloud.platform"));
+        assertTrue(docValueFields.contains("resource.attributes.deployment.environment.name"));
+    }
+
+    public void testTraceLoadFallsBackToSourceForConfiguredNonDocValueAttribute() {
+        Map<String, Object> serverSpan = span(
+            "trace-source-fallback", "server", null,
+            "payments", "SPAN_KIND_SERVER", "charge");
+        serverSpan.put("resource", Map.of("attributes", Map.of(
+            "service.version", "2.4.0")));
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(
+            List.of(List.of(serverSpan), List.of(serverSpan)),
+            Set.of("resource.attributes.service.version"));
+
+        builder(client, FIRST_TICK, List.of("service.version")).run();
+
+        SearchSourceBuilder source = client.searchRequests.get(1).source();
+        assertTrue(source.fetchSource().fetchSource());
+        assertEquals(List.of("resource.attributes"), List.of(source.fetchSource().includes()));
+        Map<String, Object> sourceNode = (Map<String, Object>)
+            documents(onlyBulk(client)).get(0).get("sourceNode");
+        assertEquals(Map.of("service.version", "2.4.0"),
+            sourceNode.get("groupByAttributes"));
     }
 
     public void testTimedOutDiscoveryDoesNotWriteOrCommit() {

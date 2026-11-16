@@ -26,6 +26,13 @@ reconciliation. The cursor advances only after the service-map write succeeds. S
 the [ServiceMapBuilder activity diagram](service-map-builder-activity.md) for the
 complete run and failure flow.
 
+Before the first trace load, each task inspects the span fields used by service-map
+generation. Compatible scalar, environment, and configured grouping fields are read
+from doc values. If a required field is unmapped or does not support doc values, the
+task retains a filtered `_source` fallback for the containing attribute object and
+logs the affected fields. The standard plugin-managed span template uses doc values
+without requiring additional configuration.
+
 Each run collects observations in a unit of work. Document IDs are hashes of the
 source and target nodes, source and target operations, observation kind, and
 event-time bucket. Equivalent traces therefore produce one edge or leaf per
