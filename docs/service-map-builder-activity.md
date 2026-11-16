@@ -24,7 +24,15 @@ flowchart TD
         discover --> hits{Page has hits?}
         hits -- No --> observations{Any span discovered<br/>during this run?}
         hits -- Yes --> traceIds[Collect distinct trace IDs<br/>from the discovery page]
-        traceIds --> loadTraces[Load all spans for affected traces<br/>using search_after pages<br/><i>trace_load</i>]
+        traceIds --> compact[Decode trace IDs into a compact<br/>16-byte run-wide set]
+        compact --> advance[Update in-memory cursor]
+        advance --> fullPage{Discovery page full?}
+        fullPage -- Yes --> nextPage[Set search_after to last hit]
+        nextPage --> discover
+        fullPage -- No --> observations
+        observations -- No --> stats[Return run statistics]
+        observations -- Yes --> partition[Re-encode one bounded trace-ID partition]
+        partition --> loadTraces[Load all spans for the partition<br/>using search_after pages<br/><i>trace_load</i>]
         loadTraces --> reconcile[Reconcile each trace<br/><i>reconcile</i>]
 
         subgraph trace["For each affected trace"]
@@ -37,13 +45,10 @@ flowchart TD
         end
 
         reconcile --> childIndex
-        consolidate --> advance[Update in-memory cursor and run counters]
-        advance --> fullPage{Discovery page full?}
-        fullPage -- Yes --> nextPage[Set search_after to last hit]
-        nextPage --> discover
-        fullPage -- No --> observations
-        observations -- No --> stats[Return run statistics]
-        observations -- Yes --> write[Bulk-index consolidated observations<br/>in chunks of at most 10,000<br/><i>service_map_write</i>]
+        consolidate --> counters[Update run counters and release<br/>the partition's loaded spans]
+        counters --> partitionsLeft{More trace-ID partitions?}
+        partitionsLeft -- Yes --> partition
+        partitionsLeft -- No --> write[Bulk-index consolidated observations<br/>in chunks of at most 10,000<br/><i>service_map_write</i>]
         write --> cacheCommit[Commit successful IDs to mutation cache]
         cacheCommit --> cursorCommit[Persist durable cursor<br/><i>state_commit</i>]
         cursorCommit --> stats
@@ -66,7 +71,8 @@ flowchart TD
 ## Processing guarantees
 
 - Discovery reads only the `traceId` and `indexedAt` doc values. Full `_source` is
-  loaded only for the affected traces.
+  loaded only after discovery completes and only for bounded partitions of unique
+  affected traces.
 - The cursor overlap allows late visibility and retry. Stable document IDs, the
   per-run unit of work, and the short-lived mutation cache prevent redundant
   service-map writes.

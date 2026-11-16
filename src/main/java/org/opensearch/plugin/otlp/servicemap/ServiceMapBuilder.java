@@ -56,12 +56,14 @@ import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionP
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_COMMIT;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.STATE_LOAD;
 import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.ExecutionPhase.TRACE_LOAD;
+import static org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics.SkippedSpanReason.INVALID_TRACE_ID;
 
 /** Builds OpenSearch APM v2 service-map observations from recently indexed spans. */
 public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static final Logger LOG = LogManager.getLogger(ServiceMapBuilder.class);
     private static final int PAGE_SIZE = 10_000;
+    private static final int TRACE_ID_PARTITION_SIZE = 10_000;
     private static final int BULK_ACTION_LIMIT = 10_000;
     private static final TimeValue DISCOVERY_DELAY = TimeValue.timeValueSeconds(2);
     private static final TimeValue CURSOR_OVERLAP = TimeValue.timeValueSeconds(10);
@@ -258,6 +260,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         long traceCount = 0;
         long spanCount = 0;
         Instant newestIndexedAt = null;
+        CompactTraceIdSet traceIds = new CompactTraceIdSet();
         long cacheRetentionMillis = CURSOR_OVERLAP.millis() + DISCOVERY_DELAY.millis() + interval.millis();
         ServiceMapMutationCache.Run mutations = mutationCache.beginRun(now, cacheRetentionMillis);
 
@@ -293,11 +296,10 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 break;
             }
 
-            Set<String> traceIds = new HashSet<>();
             for (SearchHit hit : hits) {
                 String traceId = stringValue(fieldValue(hit, "traceId"));
-                if (traceId != null) {
-                    traceIds.add(traceId);
+                if (traceIds.add(traceId) == CompactTraceIdSet.AddResult.INVALID) {
+                    metrics.recordSkippedSpan(INVALID_TRACE_ID);
                 }
             }
             SearchHit last = hits[hits.length - 1];
@@ -306,13 +308,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 metrics.recordFailure(DISCOVERY);
                 throw new IllegalStateException("Discovered span has no indexedAt value");
             }
-            Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
-                TRACE_LOAD, () -> loadTraces(traceIds));
-            executePhase(RECONCILE, () -> reconcile(spansByTrace, mutations));
-
             cursor = maxCursor(cursor, new Cursor(lastIndexedAt, last.getId()));
-            traceCount += spansByTrace.size();
-            spanCount += spansByTrace.values().stream().mapToLong(Map::size).sum();
             if (newestIndexedAt == null || lastIndexedAt.isAfter(newestIndexedAt)) {
                 newestIndexedAt = lastIndexedAt;
             }
@@ -323,6 +319,14 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
             }
         } while (true);
         if (newestIndexedAt != null) {
+            for (int offset = 0; offset < traceIds.size(); offset += TRACE_ID_PARTITION_SIZE) {
+                List<String> partition = traceIds.partition(offset, TRACE_ID_PARTITION_SIZE);
+                Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
+                    TRACE_LOAD, () -> loadTraces(partition));
+                executePhase(RECONCILE, () -> reconcile(spansByTrace, mutations));
+                traceCount += spansByTrace.size();
+                spanCount += spansByTrace.values().stream().mapToLong(Map::size).sum();
+            }
             executePhase(SERVICE_MAP_WRITE, () -> write(mutations));
             mutations.commit();
             Cursor committedCursor = cursor;
@@ -343,7 +347,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         return current;
     }
 
-    private Map<String, Map<String, ServiceMapSpan>> loadTraces(Set<String> traceIds) throws Exception {
+    private Map<String, Map<String, ServiceMapSpan>> loadTraces(Collection<String> traceIds) throws Exception {
         Map<String, Map<String, ServiceMapSpan>> spansByTrace = new LinkedHashMap<>();
         if (traceIds.isEmpty()) {
             return spansByTrace;

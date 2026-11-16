@@ -25,6 +25,7 @@ public final class ServiceMapMetrics {
     static final String TRACES_PROCESSED = "otlp.service_map.traces.processed";
     static final String SPANS_PROCESSED = "otlp.service_map.spans.processed";
     static final String PROCESSING_LAG = "otlp.service_map.span.processing_lag";
+    static final String SPANS_SKIPPED = "otlp.service_map.spans.skipped";
     static final String FAILURES = "otlp.service_map.failures";
     static final String RUNS_SKIPPED = "otlp.service_map.runs.skipped";
 
@@ -34,6 +35,7 @@ public final class ServiceMapMetrics {
     private volatile Counter tracesProcessed;
     private volatile Counter spansProcessed;
     private volatile Histogram processingLag;
+    private volatile Counter spansSkipped;
     private volatile Counter failures;
     private volatile Counter runsSkipped;
 
@@ -50,6 +52,8 @@ public final class ServiceMapMetrics {
                 SPANS_PROCESSED, "Spans evaluated by successful service-map runs", "1");
             processingLag = registry.createHistogram(
                 PROCESSING_LAG, "Delay between span indexing and successful service-map processing", "s");
+            spansSkipped = registry.createCounter(
+                SPANS_SKIPPED, "Spans skipped during service-map generation by reason", "1");
             failures = registry.createCounter(
                 FAILURES, "Service-map generation failures by phase", "1");
             runsSkipped = registry.createCounter(
@@ -90,6 +94,13 @@ public final class ServiceMapMetrics {
         }
     }
 
+    void recordSkippedSpan(SkippedSpanReason reason) {
+        Counter skippedCounter = spansSkipped;
+        if (skippedCounter != null) {
+            skippedCounter.add(1.0, reason.tags);
+        }
+    }
+
     void recordSkippedRun() {
         Counter skippedCounter = runsSkipped;
         if (skippedCounter != null) {
@@ -121,6 +132,16 @@ public final class ServiceMapMetrics {
 
         ExecutionPhase(String value) {
             tags = Tags.of("phase", value);
+        }
+    }
+
+    enum SkippedSpanReason {
+        INVALID_TRACE_ID("invalid_trace_id");
+
+        private final Tags tags;
+
+        SkippedSpanReason(String value) {
+            tags = Tags.of("reason", value);
         }
     }
 }

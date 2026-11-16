@@ -20,10 +20,11 @@ rebalance it.
 Each task runs immediately after assignment and then at the configured service-map
 interval. Every ingested span carries an `indexedAt` timestamp. A task discovers
 spans from its durable `(indexedAt, document ID)` cursor with a short overlap,
-collects the affected trace IDs, and fetches the complete spans for those traces
-before reconciliation. The cursor advances only after the service-map write
-succeeds. See the [ServiceMapBuilder activity diagram](service-map-builder-activity.md)
-for the complete run and failure flow.
+collects all distinct affected trace IDs in a compact 16-byte in-memory set, and
+then fetches the complete spans in bounded trace-ID partitions before
+reconciliation. The cursor advances only after the service-map write succeeds. See
+the [ServiceMapBuilder activity diagram](service-map-builder-activity.md) for the
+complete run and failure flow.
 
 Each run collects observations in a unit of work. Document IDs are hashes of the
 source and target nodes, source and target operations, observation kind, and
@@ -59,6 +60,7 @@ these metrics across nodes because persistent tasks can move after a failure.
 | `otlp.service_map.traces.processed` | Counter | Traces evaluated by successful runs |
 | `otlp.service_map.spans.processed` | Counter | Spans evaluated by successful runs |
 | `otlp.service_map.span.processing_lag` | Histogram | Seconds between the newest discovered span's `indexedAt` timestamp and the start of its successful run |
+| `otlp.service_map.spans.skipped` | Counter | Spans skipped during generation, tagged by `reason` |
 | `otlp.service_map.failures` | Counter | Failures, tagged by `phase` |
 | `otlp.service_map.runs.skipped` | Counter | Runs skipped because another run for the same task is active |
 

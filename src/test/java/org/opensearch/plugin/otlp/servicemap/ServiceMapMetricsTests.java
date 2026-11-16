@@ -34,6 +34,7 @@ public class ServiceMapMetricsTests extends OpenSearchTestCase {
         metrics.recordRun(1.25, ServiceMapMetrics.RunOutcome.SUCCESS);
         metrics.recordProcessed(3, 12, 2.5);
         metrics.recordFailure(ServiceMapMetrics.ExecutionPhase.TRACE_LOAD);
+        metrics.recordSkippedSpan(ServiceMapMetrics.SkippedSpanReason.INVALID_TRACE_ID);
         metrics.recordSkippedRun();
 
         assertEquals(1.0, registry.counter(ServiceMapMetrics.RUNS).total, 0.0);
@@ -43,6 +44,9 @@ public class ServiceMapMetricsTests extends OpenSearchTestCase {
         assertEquals(1.0, registry.counter(ServiceMapMetrics.FAILURES).total, 0.0);
         assertEquals("trace_load",
             registry.counter(ServiceMapMetrics.FAILURES).samples.get(0).tags().get("phase"));
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.SPANS_SKIPPED).total, 0.0);
+        assertEquals("invalid_trace_id",
+            registry.counter(ServiceMapMetrics.SPANS_SKIPPED).samples.get(0).tags().get("reason"));
         assertEquals(1.0, registry.counter(ServiceMapMetrics.RUNS_SKIPPED).total, 0.0);
         assertEquals(1.25, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.get(0).value(), 0.0);
         assertEquals("success",

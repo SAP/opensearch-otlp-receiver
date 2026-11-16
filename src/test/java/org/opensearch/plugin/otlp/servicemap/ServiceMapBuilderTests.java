@@ -20,6 +20,7 @@ import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -30,6 +31,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -317,7 +319,6 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             "trace-duplicate", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems");
         TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
             Collections.nCopies(10_000, clientSpan),
-            List.of(clientSpan, serverSpan),
             List.of(serverSpan),
             List.of(clientSpan, serverSpan)));
 
@@ -326,6 +327,32 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         BulkRequest bulk = onlyBulk(client);
         assertEquals("one edge and one leaf are written after run-wide consolidation",
             2, bulk.numberOfActions());
+        assertEquals("the duplicate trace is loaded only once after discovery completes",
+            3, client.searchRequests.size());
+    }
+
+    public void testDiscoveredTraceIdsAreLoadedInBoundedPartitions() {
+        List<Map<String, Object>> firstPage = new ArrayList<>(10_000);
+        for (int i = 1; i <= 10_000; i++) {
+            firstPage.add(discoveryHit(hexTraceId(i)));
+        }
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            firstPage,
+            List.of(discoveryHit(hexTraceId(10_001))),
+            List.of(),
+            List.of()));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals("two discovery searches and two partitioned trace loads",
+            4, client.searchRequests.size());
+        TermsQueryBuilder firstPartition =
+            (TermsQueryBuilder) client.searchRequests.get(2).source().query();
+        TermsQueryBuilder secondPartition =
+            (TermsQueryBuilder) client.searchRequests.get(3).source().query();
+        assertEquals(10_000, firstPartition.values().size());
+        assertEquals(1, secondPartition.values().size());
+        assertEquals(hexTraceId(10_001), secondPartition.values().get(0));
     }
 
     public void testUnchangedEntriesInCursorOverlapAreNotRewritten() {
@@ -393,6 +420,28 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertEquals(10.0,
             registry.histogram(ServiceMapMetrics.PROCESSING_LAG).samples.get(0).value(), 0.0);
         assertEquals(1, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.size());
+    }
+
+    public void testMalformedTraceIdIsSkippedAndRecorded() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-metrics", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-metrics", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        Map<String, Object> malformed = discoveryHit("not-a-canonical-trace-id");
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(
+            List.of(List.of(malformed, spans.get(0), spans.get(1)), spans));
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+
+        builder(client, FIRST_TICK, List.of(), null, metrics).run();
+
+        assertEquals(2, onlyBulk(client).numberOfActions());
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.SPANS_SKIPPED).total, 0.0);
+        assertEquals("invalid_trace_id",
+            registry.counter(ServiceMapMetrics.SPANS_SKIPPED).samples.get(0).tags().get("reason"));
+        assertEquals("success",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
     }
 
     public void testFailedRunRecordsOutcomeAndPhase() {
@@ -530,7 +579,7 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             String kind,
             String name) {
         Map<String, Object> span = new HashMap<>();
-        span.put("traceId", traceId);
+        span.put("traceId", canonicalTraceId(traceId));
         span.put("spanId", spanId);
         if (parentSpanId != null) {
             span.put("parentSpanId", parentSpanId);
@@ -541,6 +590,25 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         span.put("endTime", FIRST_TICK.minusSeconds(30).toString());
         span.put("indexedAt", FIRST_TICK.minusSeconds(10).toString());
         return span;
+    }
+
+    private static Map<String, Object> discoveryHit(String traceId) {
+        return Map.of(
+            "traceId", traceId,
+            "indexedAt", FIRST_TICK.minusSeconds(10).toString());
+    }
+
+    private static String canonicalTraceId(String traceId) {
+        if (traceId.length() == 32
+                && traceId.chars().allMatch(character -> Character.digit(character, 16) >= 0)) {
+            return traceId;
+        }
+        return ServiceMapHashing.sha256Hex(traceId).substring(0, 32);
+    }
+
+    private static String hexTraceId(int value) {
+        String hex = Integer.toHexString(value);
+        return "0".repeat(32 - hex.length()) + hex;
     }
 
     private static BulkRequest onlyBulk(TraceGroupEnricherTests.StubClient client) {
