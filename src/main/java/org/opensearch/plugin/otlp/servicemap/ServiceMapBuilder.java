@@ -273,10 +273,14 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
             SearchSourceBuilder source = new SearchSourceBuilder()
                 .size(PAGE_SIZE)
-                .fetchSource(new String[]{"traceId", "indexedAt"}, null)
+                .fetchSource(false)
+                .docValueField("traceId")
+                .docValueField("indexedAt", "strict_date_optional_time_nanos")
                 .query(query)
                 .sort("indexedAt", SortOrder.ASC)
-                .sort("_id", SortOrder.ASC);
+                .sort("_index", SortOrder.ASC)
+                .sort("traceId", SortOrder.ASC)
+                .sort("spanId", SortOrder.ASC);
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
             }
@@ -291,13 +295,13 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
             Set<String> traceIds = new HashSet<>();
             for (SearchHit hit : hits) {
-                String traceId = stringValue(hit.getSourceAsMap().get("traceId"));
+                String traceId = stringValue(fieldValue(hit, "traceId"));
                 if (traceId != null) {
                     traceIds.add(traceId);
                 }
             }
             SearchHit last = hits[hits.length - 1];
-            Instant lastIndexedAt = parseInstant(last.getSourceAsMap().get("indexedAt"));
+            Instant lastIndexedAt = parseInstant(fieldValue(last, "indexedAt"));
             if (lastIndexedAt == null) {
                 metrics.recordFailure(DISCOVERY);
                 throw new IllegalStateException("Discovered span has no indexedAt value");
@@ -351,7 +355,8 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
                 .fetchSource(SOURCE_FIELDS, null)
                 .query(QueryBuilders.termsQuery("traceId", traceIds))
                 .sort("_index", SortOrder.ASC)
-                .sort("_id", SortOrder.ASC);
+                .sort("traceId", SortOrder.ASC)
+                .sort("spanId", SortOrder.ASC);
             if (searchAfter != null) {
                 source.searchAfter(searchAfter);
             }
@@ -517,6 +522,10 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private static String stringValue(Object value) {
         return value instanceof String string && !string.isBlank() ? string : null;
+    }
+
+    private static Object fieldValue(SearchHit hit, String name) {
+        return hit.field(name) == null ? null : hit.field(name).getValue();
     }
 
     private static Instant parseInstant(Object value) {

@@ -24,6 +24,7 @@ import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.internal.InternalSearchResponse;
+import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Clock;
@@ -170,6 +171,24 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         assertTrue(query, query.contains("prefix"));
         assertTrue(query, query.contains("traceId"));
         assertTrue(query, query.contains("\"value\" : \"a\""));
+    }
+
+    public void testDiscoveryUsesDocValuesAndAvoidsIdFielddata() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-doc-values", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        var source = client.searchRequests.get(0).source();
+        assertFalse(source.fetchSource().fetchSource());
+        assertEquals(List.of("traceId", "indexedAt"),
+            source.docValueFields().stream().map(field -> field.field).toList());
+        assertEquals(List.of("indexedAt", "_index", "traceId", "spanId"),
+            source.sorts().stream()
+                .map(sort -> ((FieldSortBuilder) sort).getFieldName())
+                .toList());
+        assertFalse(source.toString(), source.toString().contains("\"_id\""));
     }
 
     public void testTimedOutDiscoveryDoesNotWriteOrCommit() {

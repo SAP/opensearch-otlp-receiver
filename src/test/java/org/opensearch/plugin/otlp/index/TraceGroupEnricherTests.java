@@ -19,6 +19,7 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
@@ -292,6 +293,12 @@ public class TraceGroupEnricherTests extends OpenSearchTestCase {
                 builder.map(sources.get(i));
                 SearchHit hit = new SearchHit(i, "id" + i, null, null);
                 hit.sourceRef(new BytesArray(builder.toString()));
+                for (String field : List.of("traceId", "indexedAt")) {
+                    Object value = sources.get(i).get(field);
+                    if (value != null) {
+                        hit.setDocumentField(field, new DocumentField(field, List.of(value)));
+                    }
+                }
                 // Set sort values so searchAfter can be used by callers
                 hit.sortValues(new Object[]{"id" + i}, new DocValueFormat[]{DocValueFormat.RAW});
                 hits[i] = hit;
