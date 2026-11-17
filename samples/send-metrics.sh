@@ -5,7 +5,7 @@
 set -euo pipefail
 ENDPOINT="${1:-http://localhost:4318}"
 
-NOW_NS=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time() * 1e9))")
+NOW_NS=$(python3 -c "import time; print(time.time_ns())")
 START_NS=$((NOW_NS - 60000000000))   # window start: 60 s ago
 
 curl -sf -X POST "${ENDPOINT}/v1/metrics" \

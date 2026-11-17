@@ -5,7 +5,7 @@
 set -euo pipefail
 ENDPOINT="${1:-http://localhost:4318}"
 
-NOW_NS=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time() * 1e9))")
+NOW_NS=$(python3 -c "import time; print(time.time_ns())")
 TRACE_ID="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 SPAN_ID="$(od -An -tx1 -N8  /dev/urandom | tr -d ' \n')"
 

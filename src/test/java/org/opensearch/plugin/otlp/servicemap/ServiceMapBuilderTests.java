@@ -1,0 +1,813 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to this file be
+ * licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ */
+package org.opensearch.plugin.otlp.servicemap;
+
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.ActionType;
+import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.bulk.BulkItemResponse;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.internal.InternalSearchResponse;
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.test.OpenSearchTestCase;
+
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+@SuppressWarnings("unchecked")
+public class ServiceMapBuilderTests extends OpenSearchTestCase {
+
+    private static final Instant FIRST_TICK = Instant.parse("2026-10-16T12:00:00Z");
+    private static final Instant SECOND_TICK = Instant.parse("2026-10-16T12:01:00Z");
+    private static final Instant EVENT_BUCKET = Instant.parse("2026-10-16T11:59:00Z");
+
+    public void testCrossServiceClientServerPairEmitsEdgeAndLeaf() {
+        Map<String, Object> clientSpan = span(
+            "trace-1", "client", null, "frontend", "SPAN_KIND_CLIENT", "POST /checkout");
+        Map<String, Object> serverSpan = span(
+            "trace-1", "server", "client", "checkout", "SPAN_KIND_SERVER", "Checkout");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(clientSpan, serverSpan));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        BulkRequest bulk = onlyBulk(client);
+        assertEquals("one edge and one leaf observation", 2, bulk.numberOfActions());
+        bulk.requests().forEach(request -> assertEquals(
+            DocWriteRequest.OpType.CREATE, ((IndexRequest) request).opType()));
+
+        Map<String, Object> edge = documents(bulk).stream()
+            .filter(document -> document.get("targetNode") != null)
+            .findFirst().orElseThrow();
+        assertNode(edge, "sourceNode", "frontend", "generic:default");
+        assertNode(edge, "targetNode", "checkout", "generic:default");
+        assertEquals("POST /checkout", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
+        assertEquals("Checkout", ((Map<String, Object>) edge.get("targetOperation")).get("name"));
+        assertEquals(EVENT_BUCKET.toString(), edge.get("timestamp"));
+        assertNotNull(edge.get("nodeConnectionHash"));
+        assertNotNull(edge.get("operationConnectionHash"));
+
+        Map<String, Object> leaf = documents(bulk).stream()
+            .filter(document -> document.get("targetNode") == null)
+            .findFirst().orElseThrow();
+        assertNode(leaf, "sourceNode", "checkout", "generic:default");
+        assertNull(leaf.get("targetOperation"));
+    }
+
+    public void testVersionConflictsAreAcceptedAndCursorIsCommitted() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-conflict", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-conflict", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        BulkResponseClient client = new BulkResponseClient(
+            List.of(spans, spans), bulkFailure(RestStatus.CONFLICT));
+        RecordingStateStore stateStore = new RecordingStateStore();
+
+        builder(client, FIRST_TICK, stateStore).run();
+
+        assertEquals(1, client.bulkRequests.size());
+        assertEquals(1, stateStore.commitCount);
+    }
+
+    public void testNonConflictBulkFailureDoesNotCommitCursor() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-failure", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-failure", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        BulkResponseClient client = new BulkResponseClient(
+            List.of(spans, spans), bulkFailure(RestStatus.BAD_REQUEST));
+        RecordingStateStore stateStore = new RecordingStateStore();
+
+        builder(client, FIRST_TICK, stateStore).run();
+
+        assertEquals(1, client.bulkRequests.size());
+        assertEquals(0, stateStore.commitCount);
+    }
+
+    public void testServerWithoutRootOrTraceGroupEmitsLeaf() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-orphan", "server", "missing", "worker", "SPAN_KIND_SERVER", "consume")));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        Map<String, Object> leaf = documents(onlyBulk(client)).get(0);
+        assertNode(leaf, "sourceNode", "worker", "generic:default");
+        assertNull(leaf.get("targetNode"));
+        assertFalse("v2 documents do not contain trace groups", leaf.containsKey("traceGroupName"));
+    }
+
+    public void testSameServiceCallDoesNotEmitAnEdge() {
+        Map<String, Object> clientSpan = span(
+            "trace-same", "client", null, "orders", "SPAN_KIND_CLIENT", "internal call");
+        Map<String, Object> serverSpan = span(
+            "trace-same", "server", "client", "orders", "SPAN_KIND_SERVER", "internal handler");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(clientSpan, serverSpan));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        List<Map<String, Object>> documents = documents(onlyBulk(client));
+        assertEquals(1, documents.size());
+        assertNull(documents.get(0).get("targetNode"));
+    }
+
+    public void testLateParentIsCorrelatedOnOverlappingLookback() {
+        Map<String, Object> clientSpan = span(
+            "trace-late", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /late");
+        Map<String, Object> serverSpan = span(
+            "trace-late", "server", "client", "backend", "SPAN_KIND_SERVER", "late handler");
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            List.of(serverSpan), List.of(serverSpan),
+            List.of(clientSpan, serverSpan), List.of(clientSpan, serverSpan)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK, List.of());
+
+        builder.run();
+        builder.run();
+
+        assertEquals(2, client.bulkRequests.size());
+        assertFalse(documents(client.bulkRequests.get(0)).stream()
+            .anyMatch(document -> document.get("targetNode") != null));
+        assertTrue(documents(client.bulkRequests.get(1)).stream()
+            .anyMatch(document -> document.get("targetNode") != null));
+        assertTrue("discovery is driven by the ingestion timestamp",
+            client.searchRequests.get(0).source().query().toString().contains("indexedAt"));
+    }
+
+    public void testRelationshipIdsAreIndependentOfProcessingTime() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-history", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-history", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient firstClient = stub(spans);
+        TraceGroupEnricherTests.StubClient secondClient = stub(spans);
+
+        builder(firstClient, FIRST_TICK, List.of()).run();
+        builder(secondClient, SECOND_TICK, List.of()).run();
+
+        IndexRequest first = edgeRequest(onlyBulk(firstClient));
+        IndexRequest second = edgeRequest(onlyBulk(secondClient));
+        Map<String, Object> firstSource = first.sourceAsMap();
+        Map<String, Object> secondSource = second.sourceAsMap();
+        assertEquals(firstSource.get("nodeConnectionHash"), secondSource.get("nodeConnectionHash"));
+        assertEquals(firstSource.get("operationConnectionHash"), secondSource.get("operationConnectionHash"));
+        assertEquals("the same relationship overwrites on retry", first.id(), second.id());
+        assertEquals(firstSource.get("timestamp"), secondSource.get("timestamp"));
+    }
+
+    public void testRetriesWithinIntervalUseStableTimestampAndIds() {
+        List<Map<String, Object>> spans = List.of(
+            span("a0000000000000000000000000000000", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("a0000000000000000000000000000000", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient firstClient = stub(spans);
+        TraceGroupEnricherTests.StubClient retryClient = stub(spans);
+
+        builder(firstClient, FIRST_TICK.plusSeconds(5), List.of()).run();
+        builder(retryClient, FIRST_TICK.plusSeconds(55), List.of()).run();
+
+        IndexRequest first = edgeRequest(onlyBulk(firstClient));
+        IndexRequest retry = edgeRequest(onlyBulk(retryClient));
+        assertEquals(EVENT_BUCKET.toString(), first.sourceAsMap().get("timestamp"));
+        assertEquals(first.sourceAsMap().get("timestamp"), retry.sourceAsMap().get("timestamp"));
+        assertEquals("retry in one interval overwrites the same observation", first.id(), retry.id());
+    }
+
+    public void testTraceIdPrefixIsAppliedToSearch() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("a0000000000000000000000000000000", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of(), "a").run();
+
+        String query = client.searchRequests.get(0).source().query().toString();
+        assertTrue(query, query.contains("prefix"));
+        assertTrue(query, query.contains("traceId"));
+        assertTrue(query, query.contains("\"value\" : \"a\""));
+    }
+
+    public void testDiscoveryUsesDocValuesAndAvoidsIdFielddata() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-doc-values", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        var source = client.searchRequests.get(0).source();
+        assertFalse(source.fetchSource().fetchSource());
+        assertEquals(List.of("traceId", "indexedAt"),
+            source.docValueFields().stream().map(field -> field.field).toList());
+        assertEquals(List.of("indexedAt", "_index", "traceId", "spanId"),
+            source.sorts().stream()
+                .map(sort -> ((FieldSortBuilder) sort).getFieldName())
+                .toList());
+        assertFalse(source.toString(), source.toString().contains("\"_id\""));
+    }
+
+    public void testTraceLoadUsesDocValuesWithoutSource() {
+        TraceGroupEnricherTests.StubClient client = stub(List.of(
+            span("trace-doc-values", "server", null,
+                "catalog", "SPAN_KIND_SERVER", "ListItems")));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals(1, client.fieldCapabilitiesRequests.size());
+        SearchSourceBuilder source = client.searchRequests.get(1).source();
+        assertFalse(source.fetchSource().fetchSource());
+        List<String> docValueFields = source.docValueFields().stream()
+            .map(field -> field.field).toList();
+        assertTrue(docValueFields.containsAll(List.of(
+            "traceId", "spanId", "parentSpanId", "serviceName",
+            "kind", "name", "endTime", "indexedAt")));
+        assertFalse(docValueFields.contains("startTime"));
+        assertTrue(docValueFields.contains("attributes.cloud.platform"));
+        assertTrue(docValueFields.contains("resource.attributes.deployment.environment.name"));
+    }
+
+    public void testTraceLoadFallsBackToSourceForConfiguredNonDocValueAttribute() {
+        Map<String, Object> serverSpan = span(
+            "trace-source-fallback", "server", null,
+            "payments", "SPAN_KIND_SERVER", "charge");
+        serverSpan.put("resource", Map.of("attributes", Map.of(
+            "service.version", "2.4.0")));
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(
+            List.of(List.of(serverSpan), List.of(serverSpan)),
+            Set.of("resource.attributes.service.version"));
+
+        builder(client, FIRST_TICK, List.of("service.version")).run();
+
+        SearchSourceBuilder source = client.searchRequests.get(1).source();
+        assertTrue(source.fetchSource().fetchSource());
+        assertEquals(List.of("resource.attributes"), List.of(source.fetchSource().includes()));
+        Map<String, Object> sourceNode = (Map<String, Object>)
+            documents(onlyBulk(client)).get(0).get("sourceNode");
+        assertEquals(Map.of("service.version", "2.4.0"),
+            sourceNode.get("groupByAttributes"));
+    }
+
+    public void testTimedOutDiscoveryDoesNotWriteOrCommit() {
+        assertIncompleteSearchRejected(0, incompleteSearchResponse(true, false), "discovery");
+    }
+
+    public void testPartialTraceLoadDoesNotWriteOrCommit() {
+        assertIncompleteSearchRejected(1, incompleteSearchResponse(false, true), "trace_load");
+    }
+
+    public void testStateNamespaceTracksEffectiveConfiguration() {
+        List<String> groups = List.of("service.version", "k8s.cluster.name");
+        String base = ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5),
+            groups);
+        assertTrue(base, base.matches("[0-9a-f]{64}"));
+
+        assertEquals("grouping order is not semantically significant", base,
+            ServiceMapBuilder.stateNamespace(
+                "traces-a", "service-map-a",
+                TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5),
+                List.of("k8s.cluster.name", "service.version")));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-b", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-b",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(2), TimeValue.timeValueMinutes(5), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(10), groups));
+        assertNotEquals(base, ServiceMapBuilder.stateNamespace(
+            "traces-a", "service-map-a",
+            TimeValue.timeValueMinutes(1), TimeValue.timeValueMinutes(5), List.of()));
+    }
+
+    public void testEnvironmentAndConfiguredGroupingAttributesAreEmitted() {
+        Map<String, Object> serverSpan = span(
+            "trace-env", "server", null, "payments", "SPAN_KIND_SERVER", "charge");
+        serverSpan.put("resource", Map.of("attributes", Map.of(
+            "deployment.environment.name", "production",
+            "service.version", "2.4.0",
+            "k8s.cluster.name", "eu-central")));
+        TraceGroupEnricherTests.StubClient client = stub(List.of(serverSpan));
+
+        builder(client, FIRST_TICK, List.of("service.version", "k8s.cluster.name")).run();
+
+        Map<String, Object> sourceNode = (Map<String, Object>)
+            documents(onlyBulk(client)).get(0).get("sourceNode");
+        Map<String, Object> keyAttributes = (Map<String, Object>) sourceNode.get("keyAttributes");
+        assertEquals("production", keyAttributes.get("environment"));
+        assertEquals(Map.of("service.version", "2.4.0", "k8s.cluster.name", "eu-central"),
+            sourceNode.get("groupByAttributes"));
+    }
+
+    public void testEntryServerOperationBecomesEdgeSourceOperation() {
+        Map<String, Object> entry = span(
+            "trace-entry", "entry", null, "frontend", "SPAN_KIND_SERVER", "POST /orders");
+        Map<String, Object> clientCall = span(
+            "trace-entry", "client", "entry", "frontend", "SPAN_KIND_CLIENT", "HTTP GET");
+        Map<String, Object> downstream = span(
+            "trace-entry", "downstream", "client", "inventory", "SPAN_KIND_SERVER", "Reserve");
+        TraceGroupEnricherTests.StubClient client = stub(List.of(entry, clientCall, downstream));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        Map<String, Object> edge = edgeRequest(onlyBulk(client)).sourceAsMap();
+        assertEquals("POST /orders", ((Map<String, Object>) edge.get("sourceOperation")).get("name"));
+    }
+
+    public void testLateClientDescendantLeavesHistoricalLeafUntouched() {
+        Map<String, Object> server = span(
+            "trace-leaf", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
+        Map<String, Object> internal = span(
+            "trace-leaf", "internal", "server", "checkout", "SPAN_KIND_INTERNAL", "work");
+        Map<String, Object> lateClient = span(
+            "trace-leaf", "client", "internal", "checkout", "SPAN_KIND_CLIENT", "HTTP GET");
+        lateClient.put("indexedAt", FIRST_TICK.plusSeconds(20).toString());
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            List.of(server, internal), List.of(server, internal),
+            List.of(lateClient), List.of(server, internal, lateClient)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK.plusSeconds(30), List.of());
+
+        builder.run();
+        builder.run();
+
+        assertEquals("late spans do not mutate historical observations",
+            1, client.bulkRequests.size());
+        assertNull(documents(client.bulkRequests.get(0)).get(0).get("targetNode"));
+    }
+
+    public void testCompleteTraceDoesNotEmitLeafForServerWithClientDescendant() {
+        Map<String, Object> server = span(
+            "trace-complete", "server", null, "checkout", "SPAN_KIND_SERVER", "Checkout");
+        Map<String, Object> client = span(
+            "trace-complete", "client", "server", "checkout", "SPAN_KIND_CLIENT", "HTTP GET");
+        TraceGroupEnricherTests.StubClient stub = stub(List.of(server, client));
+
+        builder(stub, FIRST_TICK, List.of()).run();
+
+        assertTrue(stub.bulkRequests.isEmpty());
+    }
+
+    public void testEquivalentRelationshipsAcrossTracesAreConsolidated() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-a", "client-a", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-a", "server-a", "client-a", "catalog", "SPAN_KIND_SERVER", "ListItems"),
+            span("trace-b", "client-b", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-b", "server-b", "client-b", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = stub(spans);
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals("one edge and one leaf per relationship and time bucket",
+            2, onlyBulk(client).numberOfActions());
+    }
+
+    public void testDuplicateEntriesAcrossDiscoveryPagesAreWrittenOncePerRun() {
+        Map<String, Object> clientSpan = span(
+            "trace-duplicate", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items");
+        Map<String, Object> serverSpan = span(
+            "trace-duplicate", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems");
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            Collections.nCopies(10_000, clientSpan),
+            List.of(serverSpan),
+            List.of(clientSpan, serverSpan)));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        BulkRequest bulk = onlyBulk(client);
+        assertEquals("one edge and one leaf are written after run-wide consolidation",
+            2, bulk.numberOfActions());
+        assertEquals("the duplicate trace is loaded only once after discovery completes",
+            3, client.searchRequests.size());
+    }
+
+    public void testDiscoveredTraceIdsAreLoadedInBoundedPartitions() {
+        List<Map<String, Object>> firstPage = new ArrayList<>(10_000);
+        for (int i = 1; i <= 10_000; i++) {
+            firstPage.add(discoveryHit(hexTraceId(i)));
+        }
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            firstPage,
+            List.of(discoveryHit(hexTraceId(10_001))),
+            List.of(),
+            List.of()));
+
+        builder(client, FIRST_TICK, List.of()).run();
+
+        assertEquals("two discovery searches and two partitioned trace loads",
+            4, client.searchRequests.size());
+        TermsQueryBuilder firstPartition =
+            (TermsQueryBuilder) client.searchRequests.get(2).source().query();
+        TermsQueryBuilder secondPartition =
+            (TermsQueryBuilder) client.searchRequests.get(3).source().query();
+        assertEquals(10_000, firstPartition.values().size());
+        assertEquals(1, secondPartition.values().size());
+        assertEquals(hexTraceId(10_001), secondPartition.values().get(0));
+    }
+
+    public void testUnchangedEntriesInCursorOverlapAreNotRewritten() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-overlap", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-overlap", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            spans, spans, spans, spans));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK, List.of());
+
+        builder.run();
+        builder.run();
+
+        assertEquals("the overlapping tick does not rewrite unchanged observations",
+            1, client.bulkRequests.size());
+        assertEquals(2, client.bulkRequests.get(0).numberOfActions());
+    }
+
+    public void testLateEntrySpanOverwritesEdgeWithCorrectedSourceOperation() {
+        Map<String, Object> clientCall = span(
+            "trace-operation", "client", "entry", "frontend",
+            "SPAN_KIND_CLIENT", "HTTP GET");
+        Map<String, Object> downstream = span(
+            "trace-operation", "downstream", "client", "inventory",
+            "SPAN_KIND_SERVER", "Reserve");
+        Map<String, Object> lateEntry = span(
+            "trace-operation", "entry", null, "frontend",
+            "SPAN_KIND_SERVER", "POST /orders");
+        lateEntry.put("indexedAt", FIRST_TICK.plusSeconds(20).toString());
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(List.of(
+            List.of(clientCall, downstream), List.of(clientCall, downstream),
+            List.of(lateEntry), List.of(lateEntry, clientCall, downstream)));
+        ServiceMapBuilder builder = builder(client, FIRST_TICK.plusSeconds(30), List.of());
+
+        builder.run();
+        IndexRequest original = edgeRequest(client.bulkRequests.get(0));
+        builder.run();
+        IndexRequest corrected = edgeRequest(client.bulkRequests.get(1));
+
+        assertNotEquals("corrected operation detail is appended as history",
+            original.id(), corrected.id());
+        assertEquals("HTTP GET",
+            ((Map<String, Object>) original.sourceAsMap().get("sourceOperation")).get("name"));
+        assertEquals("POST /orders",
+            ((Map<String, Object>) corrected.sourceAsMap().get("sourceOperation")).get("name"));
+    }
+
+    public void testSuccessfulRunRecordsWorkloadAndLag() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-metrics", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-metrics", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        TraceGroupEnricherTests.StubClient client = stub(spans);
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+
+        builder(client, FIRST_TICK, List.of(), null, metrics).run();
+
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.RUNS).total, 0.0);
+        assertEquals("success",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.TRACES_PROCESSED).total, 0.0);
+        assertEquals(2.0, registry.counter(ServiceMapMetrics.SPANS_PROCESSED).total, 0.0);
+        assertEquals(10.0,
+            registry.histogram(ServiceMapMetrics.PROCESSING_LAG).samples.get(0).value(), 0.0);
+        assertEquals(1, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.size());
+    }
+
+    public void testMalformedTraceIdIsSkippedAndRecorded() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-metrics", "client", null, "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-metrics", "server", "client", "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        Map<String, Object> malformed = discoveryHit("not-a-canonical-trace-id");
+        TraceGroupEnricherTests.StubClient client = new TraceGroupEnricherTests.StubClient(
+            List.of(List.of(malformed, spans.get(0), spans.get(1)), spans));
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+
+        builder(client, FIRST_TICK, List.of(), null, metrics).run();
+
+        assertEquals(2, onlyBulk(client).numberOfActions());
+        assertEquals(1.0, registry.counter(ServiceMapMetrics.SPANS_SKIPPED).total, 0.0);
+        assertEquals("invalid_trace_id",
+            registry.counter(ServiceMapMetrics.SPANS_SKIPPED).samples.get(0).tags().get("reason"));
+        assertEquals("success",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+    }
+
+    public void testFailedRunRecordsOutcomeAndPhase() {
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+        ServiceMapStateStore failingStateStore = new ServiceMapStateStore() {
+            @Override
+            public Cursor loadCursor(Scope scope) {
+                throw new IllegalStateException("state unavailable");
+            }
+
+            @Override
+            public void commit(Scope scope, Cursor cursor) {}
+        };
+        ServiceMapBuilder builder = new ServiceMapBuilder(
+            stub(List.of()),
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(FIRST_TICK, ZoneOffset.UTC),
+            failingStateStore,
+            metrics);
+
+        builder.run();
+
+        assertEquals("failure",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals("state_load",
+            registry.counter(ServiceMapMetrics.FAILURES).samples.get(0).tags().get("phase"));
+        assertEquals(1, registry.histogram(ServiceMapMetrics.RUN_DURATION).samples.size());
+    }
+
+    private static TraceGroupEnricherTests.StubClient stub(List<Map<String, Object>> spans) {
+        return new TraceGroupEnricherTests.StubClient(List.of(spans, spans));
+    }
+
+    private static void assertIncompleteSearchRejected(
+            int incompleteSearchIndex, SearchResponse incompleteResponse, String expectedPhase) {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-incomplete", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-incomplete", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        IncompleteSearchClient client = new IncompleteSearchClient(
+            List.of(spans), incompleteSearchIndex, incompleteResponse);
+        RecordingStateStore stateStore = new RecordingStateStore();
+        ServiceMapMetricsTests.RecordingMetricsRegistry registry =
+            new ServiceMapMetricsTests.RecordingMetricsRegistry();
+        ServiceMapMetrics metrics = new ServiceMapMetrics();
+        metrics.initialize(registry);
+        ServiceMapBuilder builder = new ServiceMapBuilder(
+            client,
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(FIRST_TICK, ZoneOffset.UTC),
+            stateStore,
+            metrics);
+
+        builder.run();
+
+        assertTrue("incomplete search must not write service-map documents",
+            client.bulkRequests.isEmpty());
+        assertEquals("incomplete search must not advance the cursor", 0, stateStore.commitCount);
+        assertEquals(Boolean.FALSE,
+            client.searchRequests.get(incompleteSearchIndex).allowPartialSearchResults());
+        assertEquals("failure",
+            registry.counter(ServiceMapMetrics.RUNS).samples.get(0).tags().get("outcome"));
+        assertEquals(expectedPhase,
+            registry.counter(ServiceMapMetrics.FAILURES).samples.get(0).tags().get("phase"));
+    }
+
+    private static SearchResponse incompleteSearchResponse(boolean timedOut, boolean failedShard) {
+        SearchHits searchHits = new SearchHits(new SearchHit[0], null, 1.0f);
+        InternalSearchResponse internal = new InternalSearchResponse(
+            searchHits, null, null, null, timedOut, false, 1);
+        ShardSearchFailure[] failures = failedShard
+            ? new ShardSearchFailure[]{
+                new ShardSearchFailure(new IllegalStateException("shard unavailable"))
+            }
+            : ShardSearchFailure.EMPTY_ARRAY;
+        return new SearchResponse(
+            internal, null, 1, failedShard ? 0 : 1, 0, 0,
+            failures, SearchResponse.Clusters.EMPTY);
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client, Instant time, List<String> groupByAttributes) {
+        return builder(client, time, groupByAttributes, null);
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
+            ServiceMapStateStore stateStore) {
+        return new ServiceMapBuilder(
+            client,
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(time, ZoneOffset.UTC),
+            stateStore,
+            new ServiceMapMetrics());
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
+            List<String> groupByAttributes,
+            String traceIdPrefix) {
+        return builder(client, time, groupByAttributes, traceIdPrefix, new ServiceMapMetrics());
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
+            List<String> groupByAttributes,
+            String traceIdPrefix,
+            ServiceMapMetrics metrics) {
+        return new ServiceMapBuilder(
+            client,
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            groupByAttributes,
+            traceIdPrefix,
+            Clock.fixed(time, ZoneOffset.UTC),
+            new LocalServiceMapStateStore(),
+            metrics);
+    }
+
+    private static Map<String, Object> span(
+            String traceId,
+            String spanId,
+            String parentSpanId,
+            String serviceName,
+            String kind,
+            String name) {
+        Map<String, Object> span = new HashMap<>();
+        span.put("traceId", canonicalTraceId(traceId));
+        span.put("spanId", spanId);
+        if (parentSpanId != null) {
+            span.put("parentSpanId", parentSpanId);
+        }
+        span.put("serviceName", serviceName);
+        span.put("kind", kind);
+        span.put("name", name);
+        span.put("endTime", FIRST_TICK.minusSeconds(30).toString());
+        span.put("indexedAt", FIRST_TICK.minusSeconds(10).toString());
+        return span;
+    }
+
+    private static Map<String, Object> discoveryHit(String traceId) {
+        return Map.of(
+            "traceId", traceId,
+            "indexedAt", FIRST_TICK.minusSeconds(10).toString());
+    }
+
+    private static String canonicalTraceId(String traceId) {
+        if (traceId.length() == 32
+                && traceId.chars().allMatch(character -> Character.digit(character, 16) >= 0)) {
+            return traceId;
+        }
+        return ServiceMapHashing.sha256Hex(traceId).substring(0, 32);
+    }
+
+    private static String hexTraceId(int value) {
+        String hex = Integer.toHexString(value);
+        return "0".repeat(32 - hex.length()) + hex;
+    }
+
+    private static BulkResponse bulkFailure(RestStatus status) {
+        BulkItemResponse.Failure failure = new BulkItemResponse.Failure(
+            "otel-v2-apm-service-map", "observation-id",
+            new IllegalStateException("bulk failure"), status);
+        return new BulkResponse(new BulkItemResponse[]{
+            new BulkItemResponse(0, DocWriteRequest.OpType.CREATE, failure)
+        }, 0);
+    }
+
+    private static BulkRequest onlyBulk(TraceGroupEnricherTests.StubClient client) {
+        assertEquals("expected one bulk request", 1, client.bulkRequests.size());
+        return client.bulkRequests.get(0);
+    }
+
+    private static List<Map<String, Object>> documents(BulkRequest bulk) {
+        return bulk.requests().stream()
+            .filter(IndexRequest.class::isInstance)
+            .map(request -> ((IndexRequest) request).sourceAsMap())
+            .toList();
+    }
+
+    private static IndexRequest edgeRequest(BulkRequest bulk) {
+        return bulk.requests().stream()
+            .map(request -> (IndexRequest) request)
+            .filter(request -> request.sourceAsMap().get("targetNode") != null)
+            .findFirst().orElseThrow();
+    }
+
+    private static void assertNode(
+            Map<String, Object> document, String field, String name, String environment) {
+        Map<String, Object> node = (Map<String, Object>) document.get(field);
+        assertEquals("service", node.get("type"));
+        Map<String, Object> keys = (Map<String, Object>) node.get("keyAttributes");
+        assertEquals(name, keys.get("name"));
+        assertEquals(environment, keys.get("environment"));
+    }
+
+    private static final class IncompleteSearchClient extends TraceGroupEnricherTests.StubClient {
+        private final int incompleteSearchIndex;
+        private final SearchResponse incompleteResponse;
+        private int searchCount;
+
+        private IncompleteSearchClient(
+                List<List<Map<String, Object>>> searchResponses,
+                int incompleteSearchIndex,
+                SearchResponse incompleteResponse) {
+            super(searchResponses);
+            this.incompleteSearchIndex = incompleteSearchIndex;
+            this.incompleteResponse = incompleteResponse;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        protected <Request extends ActionRequest, Response extends ActionResponse>
+        void doExecute(ActionType<Response> action, Request request, ActionListener<Response> listener) {
+            if (request instanceof SearchRequest searchRequest
+                    && searchCount++ == incompleteSearchIndex) {
+                searchRequests.add(searchRequest);
+                listener.onResponse((Response) incompleteResponse);
+                return;
+            }
+            super.doExecute(action, request, listener);
+        }
+    }
+
+    private static final class BulkResponseClient extends TraceGroupEnricherTests.StubClient {
+        private final BulkResponse bulkResponse;
+
+        private BulkResponseClient(
+                List<List<Map<String, Object>>> searchResponses, BulkResponse bulkResponse) {
+            super(searchResponses);
+            this.bulkResponse = bulkResponse;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        protected <Request extends ActionRequest, Response extends ActionResponse>
+        void doExecute(ActionType<Response> action, Request request, ActionListener<Response> listener) {
+            if (request instanceof BulkRequest bulkRequest) {
+                bulkRequests.add(bulkRequest);
+                listener.onResponse((Response) bulkResponse);
+                return;
+            }
+            super.doExecute(action, request, listener);
+        }
+    }
+
+    private static final class RecordingStateStore implements ServiceMapStateStore {
+        private int commitCount;
+
+        @Override
+        public Cursor loadCursor(Scope scope) {
+            return null;
+        }
+
+        @Override
+        public void commit(Scope scope, Cursor cursor) {
+            commitCount++;
+        }
+    }
+}

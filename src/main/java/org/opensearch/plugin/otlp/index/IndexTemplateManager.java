@@ -47,8 +47,8 @@ public class IndexTemplateManager implements ClusterStateListener {
             "templates/logs-otel-v1-index-standard-template.json"),
         new TemplateSpec("ss4o_metrics",     "metrics-otel-v1*",
             "templates/metrics-otel-v1-index-standard-template.json"),
-        new TemplateSpec("ss4o_service_map", "otel-v1-apm-service-map*",
-            "templates/otel-v1-apm-service-map-index-standard-template.json")
+        new TemplateSpec("ss4o_service_map", "otel-v2-apm-service-map*",
+            "templates/otel-v2-apm-service-map-index-standard-template.json")
     );
 
     private final Client client;
@@ -76,21 +76,24 @@ public class IndexTemplateManager implements ClusterStateListener {
     }
 
     private void ensureTemplate(TemplateSpec spec, ClusterChangedEvent event) {
-        if (event.state().metadata().templatesV2().containsKey(spec.name)) {
-            return;
-        }
         try {
             String json = loadResource(spec.resourcePath);
             Map<String, Object> mappings;
+            long version;
             try (XContentParser parser = XContentType.JSON.xContent().createParser(
                     NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                     json.getBytes(StandardCharsets.UTF_8))) {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> root = parser.map();
+                version = ((Number) root.get("version")).longValue();
                 @SuppressWarnings("unchecked")
                 Map<String, Object> m = (Map<String, Object>)
                     ((Map<?, ?>) root.get("template")).get("mappings");
                 mappings = m;
+            }
+            ComposableIndexTemplate existing = event.state().metadata().templatesV2().get(spec.name);
+            if (existing != null && existing.version() != null && existing.version() >= version) {
+                return;
             }
             CompressedXContent compressedMappings;
             try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
@@ -100,7 +103,7 @@ public class IndexTemplateManager implements ClusterStateListener {
             ComposableIndexTemplate indexTemplate = new ComposableIndexTemplate(
                 List.of(spec.indexPattern),
                 new Template(null, compressedMappings, null),
-                null, null, null, null
+                null, null, version, null
             );
             PutComposableIndexTemplateAction.Request request =
                 new PutComposableIndexTemplateAction.Request(spec.name);

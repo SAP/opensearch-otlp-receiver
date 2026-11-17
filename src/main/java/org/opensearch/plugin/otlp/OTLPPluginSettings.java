@@ -54,11 +54,22 @@ public final class OTLPPluginSettings {
         "plugins.otlp.traces.enrichment.batch_size", 1000, 1, Setting.Property.NodeScope);
 
     public static final Setting<String> SERVICE_MAP_INDEX = Setting.simpleString(
-        "plugins.otlp.service_map.index", "otel-v1-apm-service-map", Setting.Property.NodeScope);
+        "plugins.otlp.service_map.index", "otel-v2-apm-service-map", Setting.Property.NodeScope);
+
+    public static final Setting<Boolean> SERVICE_MAP_ENABLED = Setting.boolSetting(
+        "plugins.otlp.service_map.enabled", true, Setting.Property.NodeScope);
 
     public static final Setting<TimeValue> SERVICE_MAP_INTERVAL = Setting.timeSetting(
         "plugins.otlp.service_map.interval",
         new TimeValue(60, TimeUnit.SECONDS), Setting.Property.NodeScope);
+
+    public static final Setting<TimeValue> SERVICE_MAP_LOOKBACK_WINDOW = Setting.timeSetting(
+        "plugins.otlp.service_map.lookback_window",
+        new TimeValue(5, TimeUnit.MINUTES), Setting.Property.NodeScope);
+
+    public static final Setting<List<String>> SERVICE_MAP_GROUP_BY_ATTRIBUTES = Setting.listSetting(
+        "plugins.otlp.service_map.group_by_attributes", List.of(), value -> value,
+        Setting.Property.NodeScope);
 
     public static final Setting<Integer> MAX_INFLIGHT_REQUESTS = Setting.intSetting(
         "plugins.otlp.max_inflight_requests", 64, 1, Setting.Property.NodeScope);
@@ -72,7 +83,8 @@ public final class OTLPPluginSettings {
         CREATE_TEMPLATES,
         ENRICHMENT_ENABLED, ENRICHMENT_INTERVAL, ENRICHMENT_LOOKBACK_WINDOW,
         ENRICHMENT_TRACE_CUTOFF, ENRICHMENT_BATCH_SIZE,
-        SERVICE_MAP_INDEX, SERVICE_MAP_INTERVAL,
+        SERVICE_MAP_ENABLED, SERVICE_MAP_INDEX, SERVICE_MAP_INTERVAL,
+        SERVICE_MAP_LOOKBACK_WINDOW, SERVICE_MAP_GROUP_BY_ATTRIBUTES,
         MAX_INFLIGHT_REQUESTS, REQUIRE_ALIAS
     );
 }

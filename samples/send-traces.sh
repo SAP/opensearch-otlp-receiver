@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Send a sample trace (two spans across two services) to the OTLP HTTP endpoint.
 # The root span (frontend-service) calls the child span (backend-service),
-# which produces a cross-service edge in the service map after enrichment runs.
+# which produces a cross-service edge in the v2 service map after correlation runs.
 # Usage: ./send-traces.sh [http://localhost:4318]
 
 set -euo pipefail
 ENDPOINT="${1:-http://localhost:4318}"
 
-NOW_NS=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time() * 1e9))")
+NOW_NS=$(python3 -c "import time; print(time.time_ns())")
 END_NS=$((NOW_NS + 5000000))   # +5 ms
 
 TRACE_ID="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
@@ -84,4 +84,4 @@ echo ""
 echo "Traces sent (frontend-service → backend-service)."
 echo "After the enrichment interval (~60 s) verify with:"
 echo "  curl -s 'http://localhost:9200/otel-v1-apm-span/_search?pretty&size=2'"
-echo "  curl -s 'http://localhost:9200/otel-v1-apm-service-map/_search?pretty'"
+echo "  curl -s 'http://localhost:9200/otel-v2-apm-service-map/_search?pretty'"

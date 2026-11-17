@@ -203,6 +203,27 @@ processResources {
     }
 }
 
+def e2ePluginZip = layout.buildDirectory.file(
+    "distributions/${project.name}-${project.version}.zip"
+)
+
+tasks.register('e2eTest', Exec) {
+    group = 'verification'
+    description = 'Runs the packaged plugin end-to-end test against OpenSearch in Docker.'
+
+    dependsOn tasks.named('bundlePlugin')
+    inputs.file(e2ePluginZip)
+    inputs.files(fileTree('qa/e2e'))
+    outputs.upToDateWhen { false }
+
+    commandLine 'bash', layout.projectDirectory.file('qa/e2e/run.sh').asFile.absolutePath
+
+    doFirst {
+        environment 'E2E_PLUGIN_ZIP', e2ePluginZip.get().asFile.absolutePath
+        environment 'E2E_OPENSEARCH_IMAGE', "opensearchproject/opensearch:${opensearch_version}"
+    }
+}
+
 // Print more details if any deprecated APIs are used
 tasks.withType(JavaCompile).configureEach {
     options.compilerArgs += ['-Xlint:deprecation']

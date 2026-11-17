@@ -1,0 +1,28 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlp/opensearch:
+    endpoint: opensearch:4317
+    tls:
+      insecure: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp/opensearch]
+    metrics:
+      receivers: [otlp]
+      exporters: [otlp/opensearch]
+    logs:
+      receivers: [otlp]
+      exporters: [otlp/opensearch]

@@ -16,6 +16,7 @@ import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.List;
 
 public class SpanDocument implements IdentifiedDocument {
@@ -25,15 +26,23 @@ public class SpanDocument implements IdentifiedDocument {
     private final InstrumentationScope instrumentationScope;
     private final String instrumentationScopeSchemaUrl;
     private final Span span;
+    private final Instant indexedAt;
 
     public SpanDocument(Resource resource, String resourceSchemaUrl,
                         InstrumentationScope instrumentationScope, String instrumentationScopeSchemaUrl,
                         Span span) {
+        this(resource, resourceSchemaUrl, instrumentationScope, instrumentationScopeSchemaUrl, span, Instant.now());
+    }
+
+    public SpanDocument(Resource resource, String resourceSchemaUrl,
+                        InstrumentationScope instrumentationScope, String instrumentationScopeSchemaUrl,
+                        Span span, Instant indexedAt) {
         this.resource = resource;
         this.resourceSchemaUrl = resourceSchemaUrl;
         this.instrumentationScope = instrumentationScope;
         this.instrumentationScopeSchemaUrl = instrumentationScopeSchemaUrl;
         this.span = span;
+        this.indexedAt = indexedAt;
     }
 
     @Override
@@ -46,7 +55,8 @@ public class SpanDocument implements IdentifiedDocument {
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject()
             .field("traceId", OTLPXContentUtils.hexFromBytes(span.getTraceId()))
-            .field("spanId", OTLPXContentUtils.hexFromBytes(span.getSpanId()));
+            .field("spanId", OTLPXContentUtils.hexFromBytes(span.getSpanId()))
+            .field("indexedAt", indexedAt.toString());
         if (!span.getParentSpanId().isEmpty()) {
             builder.field("parentSpanId", OTLPXContentUtils.hexFromBytes(span.getParentSpanId()));
         }

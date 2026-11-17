@@ -16,15 +16,24 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsModule;
+import org.opensearch.core.ParseField;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.plugin.otlp.server.OTLPGrpcServiceFactory;
 import org.opensearch.plugin.otlp.index.IndexTemplateManager;
-import org.opensearch.plugin.otlp.index.ServiceMapBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricher;
+import org.opensearch.plugin.otlp.servicemap.ServiceMapMetrics;
+import org.opensearch.plugin.otlp.task.ServiceMapGenerationConfig;
+import org.opensearch.plugin.otlp.task.ServiceMapTaskCoordinator;
+import org.opensearch.plugin.otlp.task.ServiceMapTaskExecutor;
+import org.opensearch.plugin.otlp.task.ServiceMapTaskParams;
+import org.opensearch.persistent.PersistentTaskParams;
+import org.opensearch.persistent.PersistentTasksExecutor;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PersistentTaskPlugin;
 import org.opensearch.plugins.TelemetryAwarePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
@@ -42,11 +51,12 @@ import java.util.List;
 import java.util.Properties;
 import java.util.function.Supplier;
 
-public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
+public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin, PersistentTaskPlugin {
 
     private static final Logger LOG = LogManager.getLogger(OTLPPlugin.class);
 
     private final Settings settings;
+    private final ServiceMapMetrics serviceMapMetrics = new ServiceMapMetrics();
 
     public OTLPPlugin(Settings settings) {
         this.settings = settings;
@@ -80,8 +90,28 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
             Tracer tracer,
             MetricsRegistry metricsRegistry) {
 
-        if (!OTLPPluginSettings.ENABLED.get(settings)) {
-            return List.of();
+        boolean pluginEnabled = OTLPPluginSettings.ENABLED.get(settings);
+        boolean serviceMapEnabled = pluginEnabled
+            && OTLPPluginSettings.SERVICE_MAP_ENABLED.get(settings);
+        if (serviceMapEnabled) {
+            serviceMapMetrics.initialize(metricsRegistry);
+        }
+        ServiceMapGenerationConfig serviceMapConfig = new ServiceMapGenerationConfig(
+            OTLPPluginSettings.TRACES_INDEX.get(settings),
+            OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
+            OTLPPluginSettings.SERVICE_MAP_INTERVAL.get(settings).millis(),
+            OTLPPluginSettings.SERVICE_MAP_LOOKBACK_WINDOW.get(settings).millis(),
+            OTLPPluginSettings.SERVICE_MAP_GROUP_BY_ATTRIBUTES.get(settings));
+        List<Object> components = new ArrayList<>();
+        components.add(new ServiceMapTaskCoordinator(
+            client,
+            clusterService,
+            threadPool,
+            serviceMapEnabled,
+            serviceMapConfig));
+
+        if (!pluginEnabled) {
+            return components;
         }
 
         // Inject the MetricsRegistry into the BulkIndexer that OTLPGrpcServiceFactory
@@ -91,8 +121,6 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
         if (grpcFactory != null) {
             grpcFactory.setMetricsRegistry(metricsRegistry);
         }
-
-        List<Object> components = new ArrayList<>();
 
         if (OTLPPluginSettings.CREATE_TEMPLATES.get(settings)) {
             components.add(new IndexTemplateManager(client, clusterService));
@@ -108,16 +136,33 @@ public class OTLPPlugin extends Plugin implements TelemetryAwarePlugin {
                 OTLPPluginSettings.ENRICHMENT_LOOKBACK_WINDOW.get(settings),
                 OTLPPluginSettings.ENRICHMENT_TRACE_CUTOFF.get(settings),
                 OTLPPluginSettings.ENRICHMENT_BATCH_SIZE.get(settings)));
-            components.add(new ServiceMapBuilder(
-                client,
-                threadPool,
-                tracesIndex,
-                OTLPPluginSettings.SERVICE_MAP_INDEX.get(settings),
-                OTLPPluginSettings.SERVICE_MAP_INTERVAL.get(settings),
-                OTLPPluginSettings.ENRICHMENT_LOOKBACK_WINDOW.get(settings)));
         }
 
         return components;
+    }
+
+    @Override
+    public List<PersistentTasksExecutor<?>> getPersistentTasksExecutor(
+            ClusterService clusterService,
+            ThreadPool threadPool,
+            Client client,
+            SettingsModule settingsModule,
+            IndexNameExpressionResolver expressionResolver) {
+        return List.of(new ServiceMapTaskExecutor(client, threadPool, serviceMapMetrics));
+    }
+
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(new NamedWriteableRegistry.Entry(
+            PersistentTaskParams.class, ServiceMapTaskParams.NAME, ServiceMapTaskParams::new));
+    }
+
+    @Override
+    public List<NamedXContentRegistry.Entry> getNamedXContent() {
+        return List.of(new NamedXContentRegistry.Entry(
+            PersistentTaskParams.class,
+            new ParseField(ServiceMapTaskParams.NAME),
+            ServiceMapTaskParams::fromXContent));
     }
 
     @Override

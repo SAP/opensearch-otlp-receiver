@@ -16,20 +16,32 @@ import io.opentelemetry.proto.trace.v1.ScopeSpans;
 import io.opentelemetry.proto.trace.v1.Span;
 import org.opensearch.plugin.otlp.document.SpanDocument;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
 public class TraceTransformer {
+    private final Clock clock;
+
+    public TraceTransformer() {
+        this(Clock.systemUTC());
+    }
+
+    TraceTransformer(Clock clock) {
+        this.clock = clock;
+    }
 
     public List<SpanDocument> transform(ExportTraceServiceRequest request) {
         List<SpanDocument> docs = new ArrayList<>();
+        Instant indexedAt = clock.instant();
         for (ResourceSpans rs : request.getResourceSpansList()) {
             for (ScopeSpans ss : rs.getScopeSpansList()) {
                 for (Span span : ss.getSpansList()) {
                     docs.add(new SpanDocument(
                         rs.getResource(), rs.getSchemaUrl(),
                         ss.getScope(), ss.getSchemaUrl(),
-                        span));
+                        span, indexedAt));
                 }
             }
         }

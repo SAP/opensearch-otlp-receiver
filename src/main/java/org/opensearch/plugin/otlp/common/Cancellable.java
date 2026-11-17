@@ -8,27 +8,27 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
-package org.opensearch.plugin.otlp.index;
+package org.opensearch.plugin.otlp.common;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
-class Cancellable {
+public final class Cancellable {
 
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
 
-    void reset() {
+    public void reset() {
         cancelled.set(false);
     }
 
-    void cancel() {
+    public void cancel() {
         cancelled.set(true);
     }
 
-    boolean isCancelled() {
+    public boolean isCancelled() {
         return cancelled.get();
     }
 
-    static final class CancelledException extends Exception {
-        CancelledException() { super(null, null, true, false); }
+    public static final class CancelledException extends Exception {
+        public CancelledException() { super(null, null, true, false); }
     }
 }
