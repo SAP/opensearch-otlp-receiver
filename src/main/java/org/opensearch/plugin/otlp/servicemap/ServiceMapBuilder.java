@@ -319,8 +319,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         } while (true);
         if (newestIndexedAt != null) {
             ServiceMapTraceLoadPlan loadPlan = traceLoadPlan();
-            for (int offset = 0; offset < traceIds.size(); offset += TRACE_ID_PARTITION_SIZE) {
-                List<String> partition = traceIds.partition(offset, TRACE_ID_PARTITION_SIZE);
+            for (List<String> partition : traceIds.partitions(TRACE_ID_PARTITION_SIZE)) {
                 Map<String, Map<String, ServiceMapSpan>> spansByTrace = executePhase(
                     TRACE_LOAD, () -> loadTraces(partition, loadPlan));
                 executePhase(RECONCILE, () -> reconcile(spansByTrace, mutations));

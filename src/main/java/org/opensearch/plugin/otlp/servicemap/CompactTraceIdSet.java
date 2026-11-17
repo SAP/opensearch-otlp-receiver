@@ -16,6 +16,7 @@ import org.apache.lucene.util.BytesRefHash;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.NoSuchElementException;
 
 /** Stores canonical OTLP trace IDs in their compact 16-byte representation. */
 final class CompactTraceIdSet {
@@ -70,19 +71,45 @@ final class CompactTraceIdSet {
         return ids.size();
     }
 
-    /** Re-encodes one bounded partition for use in a keyword terms query. */
-    List<String> partition(int offset, int limit) {
-        if (offset < 0 || limit < 1 || offset > ids.size()) {
-            throw new IllegalArgumentException(
-                "Invalid trace-ID partition: offset=" + offset + ", limit=" + limit);
+    Iterable<List<String>> partitions(int partitionSize) {
+        if (partitionSize < 1) {
+            throw new IllegalArgumentException("Invalid trace-ID partition size: " + partitionSize);
         }
-        int end = Math.min(ids.size(), offset + limit);
-        List<String> result = new ArrayList<>(end - offset);
-        BytesRef value = new BytesRef();
-        for (int id = offset; id < end; id++) {
-            ids.get(id, value);
-            result.add(HEX.formatHex(value.bytes, value.offset, value.offset + value.length));
-        }
-        return result;
+        return () -> new java.util.Iterator<>() {
+            private int offset = 0;
+            private final BytesRef value = new BytesRef();
+            private final int size = ids.size();
+
+            @Override
+            public boolean hasNext() {
+                return offset < size;
+            }
+
+            @Override
+            public List<String> next() {
+                List<String> partition = partition(offset, partitionSize);
+                offset += partition.size();
+                return partition;
+            }
+
+            /** Re-encodes one bounded partition for use in a keyword terms query. */
+            private List<String> partition(int offset, int limit) {
+                if (!hasNext()) {
+                    throw new NoSuchElementException("No more trace-ID partitions");
+                }
+                if (offset < 0 || limit < 1 || offset > size) {
+                    throw new IllegalArgumentException(
+                            "Invalid trace-ID partition: offset=" + offset + ", limit=" + limit);
+                }
+                int end = Math.min(size, offset + limit);
+                List<String> result = new ArrayList<>(end - offset);
+                for (int id = offset; id < end; id++) {
+                    ids.get(id, value);
+                    result.add(HEX.formatHex(value.bytes, value.offset, value.offset + value.length));
+                }
+                return result;
+            }
+        };
     }
+
 }
