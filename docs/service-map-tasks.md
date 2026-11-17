@@ -39,6 +39,13 @@ event-time bucket. Equivalent traces therefore produce one edge or leaf per
 relationship and bucket. The same relationship in a later bucket creates another
 document, preserving service-map history.
 
+Observations are written with create-only bulk operations. Equivalent observations
+can be produced concurrently from traces in different trace-ID prefix partitions,
+which are owned by different persistent tasks. If another task has already created
+the same document ID, the resulting `409 Conflict` is accepted as successful
+deduplication. It does not replace the existing Lucene document. Any other bulk
+item failure fails the run and prevents the durable cursor from advancing.
+
 Leaves and edges are append-only observations. A late span can add an edge or
 corrected operation detail but does not delete an earlier leaf. Dashboards
 deduplicates topology by `nodeConnectionHash` and operation detail by
@@ -75,7 +82,9 @@ The `outcome` values are `success`, `failure`, and `cancelled`. Processing lag i
 recorded only when a successful run discovers spans. Trace and span counters measure
 evaluation work rather than unique documents: cursor overlap, retries, and late spans
 can cause a trace to be evaluated more than once. Service-map document writes are
-intentionally left to the native metrics of the service-map index.
+intentionally left to the native metrics of the service-map index. Expected create
+conflicts can therefore appear in the index's native failed-indexing counter even
+though the corresponding service-map run succeeds.
 
 Failures identify the execution phase in which the run stopped:
 
@@ -85,7 +94,7 @@ Failures identify the execution phase in which the run stopped:
 | `discovery` | Find newly indexed spans for the task's trace-ID prefix |
 | `trace_load` | Load the complete affected traces and parse their spans |
 | `reconcile` | Build and consolidate relationship observations |
-| `service_map_write` | Bulk-index service-map edges and leaves |
+| `service_map_write` | Bulk-create service-map edges and leaves; accept duplicate `409 Conflict` items |
 | `state_commit` | Persist the updated cursor |
 
 ## Current limits

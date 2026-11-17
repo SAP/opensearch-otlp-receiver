@@ -49,8 +49,11 @@ flowchart TD
         consolidate --> counters[Update run counters and release<br/>the partition's loaded spans]
         counters --> partitionsLeft{More trace-ID partitions?}
         partitionsLeft -- Yes --> partition
-        partitionsLeft -- No --> write[Bulk-index consolidated observations<br/>in chunks of at most 10,000<br/><i>service_map_write</i>]
-        write --> cacheCommit[Commit successful IDs to mutation cache]
+        partitionsLeft -- No --> write[Bulk-create consolidated observations<br/>in chunks of at most 10,000<br/><i>service_map_write</i>]
+        write --> writeResult{Any failed item<br/>other than 409 Conflict?}
+        writeResult -- No --> cacheCommit[Commit successful and conflicting IDs<br/>to mutation cache]
+        writeResult -- Yes --> writeFailure[Fail service-map write phase]
+        writeFailure -.-> failed
         cacheCommit --> cursorCommit[Persist durable cursor<br/><i>state_commit</i>]
         cursorCommit --> stats
     end
@@ -79,8 +82,13 @@ flowchart TD
   service-map writes.
 - Edge and leaf observations are append-only. A later edge does not delete an
   earlier leaf observation.
-- The durable cursor advances only after every service-map bulk request succeeds.
-  A failed run therefore retries the same discovery window.
+- Service-map observations use create-only writes. Equivalent observations from
+  traces in different trace-ID partitions can be processed concurrently by
+  different persistent tasks. The resulting `409 Conflict` is expected
+  deduplication and does not replace the existing Lucene document.
+- The durable cursor advances only after every service-map bulk item was either
+  created or returned an expected `409 Conflict`. Any other item failure retries
+  the same discovery window.
 - Search and bulk operations are cancellation-aware. Timed-out or partial searches
   fail the run instead of advancing state from incomplete data.
 

@@ -12,6 +12,7 @@ package org.opensearch.plugin.otlp.servicemap;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest;
@@ -22,6 +23,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.plugin.otlp.common.Cancellable;
@@ -450,6 +452,7 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
         BulkRequest bulk = new BulkRequest();
         for (Map.Entry<String, Map<String, Object>> entry : mutations.documents().entrySet()) {
             bulk.add(new IndexRequest(serviceMapIndex).id(entry.getKey())
+                .opType(DocWriteRequest.OpType.CREATE)
                 .source(entry.getValue(), XContentType.JSON));
             if (bulk.numberOfActions() == BULK_ACTION_LIMIT) {
                 write(bulk);
@@ -464,9 +467,13 @@ public class ServiceMapBuilder extends AbstractLifecycleComponent {
 
     private void write(BulkRequest bulk) throws Exception {
         BulkResponse response = serviceMapClient.bulk(bulk).get();
-        if (response.hasFailures()) {
-            throw new IllegalStateException("Failed to index service-map observations: "
-                + response.buildFailureMessage());
+        for (var item : response.getItems()) {
+            // An identical observation can be created by another trace-ID partition
+            // running concurrently in a different persistent task, so conflicts are expected.
+            if (item.isFailed() && item.status() != RestStatus.CONFLICT) {
+                throw new IllegalStateException("Failed to index service-map observation ["
+                    + item.getId() + "]: " + item.getFailureMessage());
+            }
         }
     }
 

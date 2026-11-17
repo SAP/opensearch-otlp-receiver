@@ -12,7 +12,10 @@ package org.opensearch.plugin.otlp.servicemap;
 
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
+import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -20,6 +23,7 @@ import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.plugin.otlp.index.TraceGroupEnricherTests;
 import org.opensearch.search.SearchHit;
@@ -58,6 +62,8 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
 
         BulkRequest bulk = onlyBulk(client);
         assertEquals("one edge and one leaf observation", 2, bulk.numberOfActions());
+        bulk.requests().forEach(request -> assertEquals(
+            DocWriteRequest.OpType.CREATE, ((IndexRequest) request).opType()));
 
         Map<String, Object> edge = documents(bulk).stream()
             .filter(document -> document.get("targetNode") != null)
@@ -75,6 +81,38 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
             .findFirst().orElseThrow();
         assertNode(leaf, "sourceNode", "checkout", "generic:default");
         assertNull(leaf.get("targetOperation"));
+    }
+
+    public void testVersionConflictsAreAcceptedAndCursorIsCommitted() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-conflict", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-conflict", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        BulkResponseClient client = new BulkResponseClient(
+            List.of(spans, spans), bulkFailure(RestStatus.CONFLICT));
+        RecordingStateStore stateStore = new RecordingStateStore();
+
+        builder(client, FIRST_TICK, stateStore).run();
+
+        assertEquals(1, client.bulkRequests.size());
+        assertEquals(1, stateStore.commitCount);
+    }
+
+    public void testNonConflictBulkFailureDoesNotCommitCursor() {
+        List<Map<String, Object>> spans = List.of(
+            span("trace-failure", "client", null,
+                "frontend", "SPAN_KIND_CLIENT", "GET /items"),
+            span("trace-failure", "server", "client",
+                "catalog", "SPAN_KIND_SERVER", "ListItems"));
+        BulkResponseClient client = new BulkResponseClient(
+            List.of(spans, spans), bulkFailure(RestStatus.BAD_REQUEST));
+        RecordingStateStore stateStore = new RecordingStateStore();
+
+        builder(client, FIRST_TICK, stateStore).run();
+
+        assertEquals(1, client.bulkRequests.size());
+        assertEquals(0, stateStore.commitCount);
     }
 
     public void testServerWithoutRootOrTraceGroupEmitsLeaf() {
@@ -589,6 +627,24 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
     private static ServiceMapBuilder builder(
             TraceGroupEnricherTests.StubClient client,
             Instant time,
+            ServiceMapStateStore stateStore) {
+        return new ServiceMapBuilder(
+            client,
+            null,
+            "otel-v1-apm-span",
+            "otel-v2-apm-service-map",
+            new TimeValue(60, TimeUnit.SECONDS),
+            new TimeValue(5, TimeUnit.MINUTES),
+            List.of(),
+            null,
+            Clock.fixed(time, ZoneOffset.UTC),
+            stateStore,
+            new ServiceMapMetrics());
+    }
+
+    private static ServiceMapBuilder builder(
+            TraceGroupEnricherTests.StubClient client,
+            Instant time,
             List<String> groupByAttributes,
             String traceIdPrefix) {
         return builder(client, time, groupByAttributes, traceIdPrefix, new ServiceMapMetrics());
@@ -654,6 +710,15 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
         return "0".repeat(32 - hex.length()) + hex;
     }
 
+    private static BulkResponse bulkFailure(RestStatus status) {
+        BulkItemResponse.Failure failure = new BulkItemResponse.Failure(
+            "otel-v2-apm-service-map", "observation-id",
+            new IllegalStateException("bulk failure"), status);
+        return new BulkResponse(new BulkItemResponse[]{
+            new BulkItemResponse(0, DocWriteRequest.OpType.CREATE, failure)
+        }, 0);
+    }
+
     private static BulkRequest onlyBulk(TraceGroupEnricherTests.StubClient client) {
         assertEquals("expected one bulk request", 1, client.bulkRequests.size());
         return client.bulkRequests.get(0);
@@ -704,6 +769,28 @@ public class ServiceMapBuilderTests extends OpenSearchTestCase {
                     && searchCount++ == incompleteSearchIndex) {
                 searchRequests.add(searchRequest);
                 listener.onResponse((Response) incompleteResponse);
+                return;
+            }
+            super.doExecute(action, request, listener);
+        }
+    }
+
+    private static final class BulkResponseClient extends TraceGroupEnricherTests.StubClient {
+        private final BulkResponse bulkResponse;
+
+        private BulkResponseClient(
+                List<List<Map<String, Object>>> searchResponses, BulkResponse bulkResponse) {
+            super(searchResponses);
+            this.bulkResponse = bulkResponse;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        protected <Request extends ActionRequest, Response extends ActionResponse>
+        void doExecute(ActionType<Response> action, Request request, ActionListener<Response> listener) {
+            if (request instanceof BulkRequest bulkRequest) {
+                bulkRequests.add(bulkRequest);
+                listener.onResponse((Response) bulkResponse);
                 return;
             }
             super.doExecute(action, request, listener);
